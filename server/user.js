@@ -39,6 +39,8 @@ const login = (req, res) => {
                         let branch_id = results[0].branch_id;
                         let last_login= results[0].last_login;
                         let login_type = results[0].login_type
+                        let entity_type = results[0].entity_type;
+                        let entity_id = results[0].entity_id;
                         hash.update(passkey);
                         let value = hash.digest('hex');
                         if (value === mockedPassword) {
@@ -49,7 +51,9 @@ const login = (req, res) => {
                                 role: role,
                                 role_name: role_name,
                                 login_type: login_type,
-                                category_id: catgory_id
+                                category_id: catgory_id,
+                                entity_type: entity_type,
+                                entity_id: entity_id
                             },
                                 secret,
                                 { expiresIn: '168h' }
@@ -76,7 +80,10 @@ const login = (req, res) => {
                                 branch_id: branch_id,
                                 last_login: last_login,
                                 login_type : login_type,
-                                catgory_id : catgory_id
+                                catgory_id : catgory_id,
+                                entity_type: entity_type,
+                                entity_id: entity_id,
+                                teacher_id: entity_type === 'TEACHER' ? entity_id : null
                             });
                         } else {
                             return res.json({ statusCode: 300, message: "Invalid Password" })

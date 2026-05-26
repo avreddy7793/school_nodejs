@@ -1,13 +1,19 @@
 const globalDatabase = process.env.DB_GLOBAL_DATABASE || process.env.DB_DATABASE || 'global';
+const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 
 const loginTable = table('login');
 const clientCategoryTable = table('client_category');
 const clientMasterTable = table('client_master');
 const employeesTable = table('employess');
 const rolesTable = table('roles');
+const userEntityLinksTable = schoolTable('user_entity_links');
 
 function table(name) {
     return `${escapeIdentifier(globalDatabase)}.${escapeIdentifier(name)}`;
+}
+
+function schoolTable(name) {
+    return `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier(name)}`;
 }
 
 function escapeIdentifier(value) {
@@ -34,12 +40,15 @@ let login = `SELECT
     l.role, 
     r.role_name,
     l.branch_id, 
-    l.emp_id
+    l.emp_id,
+    uel.entity_type,
+    uel.entity_id
 FROM ${loginTable} l
 LEFT JOIN ${clientCategoryTable} cc ON l.category = cc.id
 LEFT JOIN ${clientMasterTable} cm ON l.client_id = cm.client_id
 LEFT JOIN ${employeesTable} e ON l.emp_id = e.emp_id
 LEFT JOIN ${rolesTable} r ON l.role = r.id
+LEFT JOIN ${userEntityLinksTable} uel ON uel.login_id = l.login_id AND uel.status = 'ACTIVE'
 WHERE l.login_email = (?);`;
 let getProfile = `select * from ${loginTable} where login_id = ?`;
 let alluserslist = `select * from ${loginTable} order by update_date desc`;
