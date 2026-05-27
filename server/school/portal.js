@@ -4,6 +4,7 @@ const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const db = pool.promise();
 
 const studentsTable = table('students');
+const teachersTable = table('teachers');
 const classroomsTable = table('classrooms');
 const userEntityLinksTable = table('user_entity_links');
 const parentStudentLinksTable = table('parent_student_links');
@@ -11,16 +12,21 @@ const examResultsTable = table('exam_results');
 const examsTable = table('exams');
 const subjectsTable = table('subjects');
 const studentAttendanceTable = table('student_attendance');
+const teacherAttendanceTable = table('teacher_attendance');
 const legacyAttendanceTable = table('attendance');
 const schedulesTable = table('class_schedule');
+const sessionsTable = table('school_sessions');
+const periodsTable = table('session_periods');
 const feeRecordsTable = table('fee_records');
 const transportsTable = table('transports');
 const staffTable = table('staff');
+const teacherLeavesTable = table('teacher_leaves');
 const assignmentsTable = table('student_room_assignments');
 const roomsTable = table('hostel_rooms');
 const hostelPaymentsTable = table('hostel_payments');
 
 let hostelPaymentsReady = false;
+let teacherAttendanceColumns = null;
 
 function table(name) {
   return `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier(name)}`;
@@ -61,6 +67,17 @@ function isParentOrStudent(decoded) {
   return candidates.some((value) => ['PARENT', 'GUARDIAN', 'FATHER', 'MOTHER', 'STUDENT'].includes(value));
 }
 
+function isTeacher(decoded) {
+  const candidates = [
+    normalizeRole(decoded?.role),
+    normalizeRole(decoded?.role_name),
+    normalizeRole(decoded?.login_type),
+    normalizeRole(decoded?.entity_type)
+  ];
+
+  return candidates.includes('TEACHER');
+}
+
 function getDecodedContext(req) {
   const decoded = req.decoded || {};
   return {
@@ -68,6 +85,45 @@ function getDecodedContext(req) {
     clientId: normalizePositiveInteger(decoded.client_id || req.query.client_id),
     loginEmail: decoded.login_email ? String(decoded.login_email).trim() : '',
     decoded
+  };
+}
+
+function emptyStudentPortalPayload(clientId) {
+  return {
+    portal_type: 'student',
+    clientId,
+    students: [],
+    results: [],
+    upcomingExams: [],
+    attendance: [],
+    fees: [],
+    transport: [],
+    hostel: { assignments: [], payments: [] },
+    totals: {
+      students: 0,
+      attendance: { total: 0, present: 0, absent: 0, late: 0, leave: 0 },
+      fees: { total: 0, paid: 0, due: 0 },
+      hostel: { total: 0, paid: 0, due: 0 }
+    }
+  };
+}
+
+function emptyTeacherPortalPayload(clientId) {
+  return {
+    ...emptyStudentPortalPayload(clientId),
+    portal_type: 'teacher',
+    teacher: null,
+    teacherSchedules: [],
+    teacherExams: [],
+    teacherAttendance: [],
+    teacherLeaves: [],
+    teacherTotals: {
+      schedules: 0,
+      classes: 0,
+      upcomingExams: 0,
+      attendance: { total: 0, present: 0, absent: 0, late: 0, leave: 0 },
+      leaves: { total: 0, pending: 0, approved: 0, rejected: 0 }
+    }
   };
 }
 
@@ -99,6 +155,16 @@ async function ensureHostelPaymentsTable() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
   hostelPaymentsReady = true;
+}
+
+async function getTeacherAttendanceColumns() {
+  if (teacherAttendanceColumns) {
+    return teacherAttendanceColumns;
+  }
+
+  const [rows] = await db.query(`SHOW COLUMNS FROM ${teacherAttendanceTable}`);
+  teacherAttendanceColumns = new Set(rows.map((row) => row.Field));
+  return teacherAttendanceColumns;
 }
 
 async function getScopedStudentIds(req) {
@@ -149,6 +215,55 @@ async function getScopedStudentIds(req) {
     .filter(Boolean);
 
   return { clientId, studentIds: [...new Set(matchedIds)] };
+}
+
+async function getScopedTeacherId(req) {
+  const { loginId, clientId, loginEmail, decoded } = getDecodedContext(req);
+
+  if (!loginId || !clientId || !isTeacher(decoded)) {
+    return { clientId, teacherId: null };
+  }
+
+  const tokenTeacherId = normalizeRole(decoded.entity_type) === 'TEACHER'
+    ? normalizePositiveInteger(decoded.entity_id)
+    : null;
+
+  if (tokenTeacherId) {
+    return { clientId, teacherId: tokenTeacherId };
+  }
+
+  const [linkedRows] = await db.query(`
+    SELECT entity_id AS teacher_id
+    FROM ${userEntityLinksTable}
+    WHERE client_id = ?
+      AND login_id = ?
+      AND entity_type = 'TEACHER'
+      AND (status IS NULL OR status = 'ACTIVE')
+    LIMIT 1
+  `, [clientId, loginId]);
+
+  const linkedTeacherId = normalizePositiveInteger(linkedRows[0]?.teacher_id);
+
+  if (linkedTeacherId) {
+    return { clientId, teacherId: linkedTeacherId };
+  }
+
+  if (!loginEmail) {
+    return { clientId, teacherId: null };
+  }
+
+  const [matchedRows] = await db.query(`
+    SELECT teacher_id
+    FROM ${teachersTable}
+    WHERE client_id = ?
+      AND email = ?
+    LIMIT 1
+  `, [clientId, loginEmail]);
+
+  return {
+    clientId,
+    teacherId: normalizePositiveInteger(matchedRows[0]?.teacher_id)
+  };
 }
 
 function filterStudentIds(studentIds, requestedStudentId) {
@@ -468,6 +583,209 @@ async function fetchHostel(clientId, studentIds) {
   return { assignments, payments };
 }
 
+async function fetchTeacher(clientId, teacherId) {
+  if (!teacherId) {
+    return null;
+  }
+
+  const [rows] = await db.query(`
+    SELECT
+      teacher_id,
+      client_id,
+      CONCAT_WS(' ', first_name, middle_name, last_name) AS teacher_name,
+      first_name,
+      middle_name,
+      last_name,
+      email,
+      phone_number,
+      alternate_phone,
+      gender,
+      department,
+      designation,
+      qualification,
+      experience_years,
+      subjects_taught,
+      date_of_joining,
+      employment_status,
+      address_line1,
+      city,
+      state,
+      country
+    FROM ${teachersTable}
+    WHERE client_id = ?
+      AND teacher_id = ?
+    LIMIT 1
+  `, [clientId, teacherId]);
+
+  return rows[0] || null;
+}
+
+async function fetchTeacherSchedules(clientId, teacherId) {
+  if (!teacherId) {
+    return [];
+  }
+
+  const [rows] = await db.query(`
+    SELECT
+      cs.schedule_id,
+      cs.teacher_id,
+      cs.classroom_id,
+      c.name AS classroom_name,
+      cs.session_id,
+      ss.name AS session_name,
+      cs.period_id,
+      sp.label AS period_label,
+      sp.start_time,
+      sp.end_time,
+      sp.duration_minutes,
+      cs.subject,
+      cs.grade,
+      cs.section,
+      cs.day_of_week,
+      cs.schedule_date,
+      cs.status,
+      cs.notes
+    FROM ${schedulesTable} cs
+    LEFT JOIN ${classroomsTable} c ON c.classroom_id = cs.classroom_id
+    LEFT JOIN ${sessionsTable} ss ON ss.session_id = cs.session_id
+    LEFT JOIN ${periodsTable} sp ON sp.period_id = cs.period_id
+    WHERE cs.client_id = ?
+      AND cs.teacher_id = ?
+      AND (cs.status IS NULL OR cs.status = 'Active')
+    ORDER BY
+      COALESCE(cs.day_of_week, 8) ASC,
+      cs.session_id ASC,
+      sp.period_number ASC,
+      c.name ASC
+  `, [clientId, teacherId]);
+
+  return rows;
+}
+
+async function fetchTeacherExams(clientId, teacherId) {
+  if (!teacherId) {
+    return [];
+  }
+
+  const [rows] = await db.query(`
+    SELECT DISTINCT
+      e.exam_id,
+      e.subject_id,
+      s.sub_name AS subject_name,
+      s.classroom_id,
+      c.name AS classroom_name,
+      e.exam_date,
+      e.total_marks,
+      e.passing_marks,
+      e.duration,
+      CASE
+        WHEN e.exam_date >= CURDATE() THEN 'Scheduled'
+        ELSE 'Completed'
+      END AS exam_status
+    FROM ${examsTable} e
+    INNER JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
+    LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.classroom_id
+    INNER JOIN ${schedulesTable} cs ON cs.client_id = e.client_id
+      AND cs.teacher_id = ?
+      AND cs.classroom_id = s.classroom_id
+      AND (cs.status IS NULL OR cs.status = 'Active')
+      AND (
+        LOWER(TRIM(cs.subject)) = LOWER(TRIM(s.sub_name))
+        OR cs.subject IS NULL
+        OR s.sub_name IS NULL
+      )
+    WHERE e.client_id = ?
+    ORDER BY e.exam_date DESC, e.exam_id DESC
+    LIMIT 50
+  `, [teacherId, clientId]);
+
+  return rows;
+}
+
+async function fetchTeacherAttendance(clientId, teacherId) {
+  if (!teacherId) {
+    return [];
+  }
+
+  const columns = await getTeacherAttendanceColumns();
+
+  if (!columns.has('schedule_id')) {
+    const [rows] = await db.query(`
+      SELECT
+        ta.attendance_id AS teacher_attendance_id,
+        NULL AS schedule_id,
+        ta.teacher_id,
+        ta.attendance_date,
+        ta.status,
+        ta.check_in_time AS check_in,
+        ta.remarks AS notes,
+        NULL AS marked_by,
+        NULL AS subject,
+        NULL AS classroom_name,
+        NULL AS period_label,
+        NULL AS start_time,
+        NULL AS end_time
+      FROM ${teacherAttendanceTable} ta
+      WHERE ta.client_id = ?
+        AND ta.teacher_id = ?
+      ORDER BY ta.attendance_date DESC, ta.attendance_id DESC
+      LIMIT 60
+    `, [clientId, teacherId]);
+
+    return rows;
+  }
+
+  const [rows] = await db.query(`
+    SELECT
+      ta.teacher_attendance_id,
+      ta.schedule_id,
+      ta.teacher_id,
+      ta.attendance_date,
+      ta.status,
+      ta.check_in,
+      ta.notes,
+      ta.marked_by,
+      cs.subject,
+      c.name AS classroom_name,
+      sp.label AS period_label,
+      sp.start_time,
+      sp.end_time
+    FROM ${teacherAttendanceTable} ta
+    LEFT JOIN ${schedulesTable} cs ON cs.schedule_id = ta.schedule_id
+    LEFT JOIN ${classroomsTable} c ON c.classroom_id = cs.classroom_id
+    LEFT JOIN ${periodsTable} sp ON sp.period_id = cs.period_id
+    WHERE ta.teacher_id = ?
+      AND (cs.client_id = ? OR cs.client_id IS NULL)
+    ORDER BY ta.attendance_date DESC, ta.teacher_attendance_id DESC
+    LIMIT 60
+  `, [teacherId, clientId]);
+
+  return rows;
+}
+
+async function fetchTeacherLeaves(clientId, teacherId) {
+  if (!teacherId) {
+    return [];
+  }
+
+  const [rows] = await db.query(`
+    SELECT
+      leave_id,
+      teacher_id,
+      leave_date,
+      leave_type,
+      reason,
+      status
+    FROM ${teacherLeavesTable}
+    WHERE client_id = ?
+      AND teacher_id = ?
+    ORDER BY leave_date DESC, leave_id DESC
+    LIMIT 30
+  `, [clientId, teacherId]);
+
+  return rows;
+}
+
 function summarizeAttendance(attendance) {
   return attendance.reduce((summary, record) => {
     const key = String(record.status || '').toLowerCase();
@@ -495,7 +813,64 @@ function summarizeMoney(records) {
   }, { total: 0, paid: 0, due: 0 });
 }
 
+function summarizeTeacherLeaves(leaves) {
+  return leaves.reduce((summary, record) => {
+    const key = String(record.status || '').toLowerCase();
+    if (key.includes('approved')) {
+      summary.approved += 1;
+    } else if (key.includes('reject')) {
+      summary.rejected += 1;
+    } else {
+      summary.pending += 1;
+    }
+
+    summary.total += 1;
+    return summary;
+  }, { total: 0, pending: 0, approved: 0, rejected: 0 });
+}
+
+async function buildTeacherPortalPayload(req) {
+  const scope = await getScopedTeacherId(req);
+
+  if (!scope.clientId || !scope.teacherId) {
+    return emptyTeacherPortalPayload(scope.clientId);
+  }
+
+  const [teacher, teacherSchedules, teacherExams, teacherAttendance, teacherLeaves] = await Promise.all([
+    fetchTeacher(scope.clientId, scope.teacherId),
+    fetchTeacherSchedules(scope.clientId, scope.teacherId),
+    fetchTeacherExams(scope.clientId, scope.teacherId),
+    fetchTeacherAttendance(scope.clientId, scope.teacherId),
+    fetchTeacherLeaves(scope.clientId, scope.teacherId)
+  ]);
+
+  return {
+    ...emptyTeacherPortalPayload(scope.clientId),
+    teacher,
+    teacherSchedules,
+    teacherExams,
+    teacherAttendance,
+    teacherLeaves,
+    teacherTotals: {
+      schedules: teacherSchedules.length,
+      classes: new Set(
+        teacherSchedules
+          .map((row) => normalizePositiveInteger(row.classroom_id))
+          .filter(Boolean)
+      ).size,
+      upcomingExams: teacherExams.filter((exam) => String(exam.exam_status || '').toLowerCase() === 'scheduled').length,
+      attendance: summarizeAttendance(teacherAttendance),
+      leaves: summarizeTeacherLeaves(teacherLeaves)
+    }
+  };
+}
+
 async function buildPortalPayload(req, requestedStudentId = null) {
+  const context = getDecodedContext(req);
+  if (isTeacher(context.decoded)) {
+    return requestedStudentId ? { forbidden: true } : buildTeacherPortalPayload(req);
+  }
+
   const scope = await getScopedStudentIds(req);
   const filteredScope = filterStudentIds(scope.studentIds, requestedStudentId);
 
@@ -506,22 +881,7 @@ async function buildPortalPayload(req, requestedStudentId = null) {
   const studentIds = filteredScope.studentIds;
 
   if (!scope.clientId || !studentIds.length) {
-    return {
-      clientId: scope.clientId,
-      students: [],
-      results: [],
-      upcomingExams: [],
-      attendance: [],
-      fees: [],
-      transport: [],
-      hostel: { assignments: [], payments: [] },
-      totals: {
-        students: 0,
-        attendance: { total: 0, present: 0, absent: 0, late: 0, leave: 0 },
-        fees: { total: 0, paid: 0, due: 0 },
-        hostel: { total: 0, paid: 0, due: 0 }
-      }
-    };
+    return emptyStudentPortalPayload(scope.clientId);
   }
 
   const [students, results, upcomingExams, attendance, fees, transport, hostel] = await Promise.all([
@@ -535,6 +895,7 @@ async function buildPortalPayload(req, requestedStudentId = null) {
   ]);
 
   return {
+    portal_type: 'student',
     clientId: scope.clientId,
     students,
     results,
