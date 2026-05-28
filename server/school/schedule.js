@@ -35,6 +35,11 @@ function normalizeString(value) {
   return trimmed || null;
 }
 
+function normalizePositiveInteger(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
 function getValue(body, key, fallback = undefined) {
   if (body[key] !== undefined) {
     return body[key];
@@ -374,6 +379,98 @@ function updateSchedule(req, res) {
   });
 }
 
+function assignTeacherToSchedule(req, res) {
+  const scheduleId = normalizePositiveInteger(req.params.scheduleId);
+  const teacherId = normalizePositiveInteger(getValue(req.body, 'teacherId', getValue(req.body, 'teacher_id')));
+  const clientId = normalizePositiveInteger(getValue(req.body, 'clientId', getValue(req.body, 'client_id', req.query.client_id || req.decoded?.client_id)));
+
+  if (!scheduleId || !teacherId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Schedule and teacher are required'
+    });
+  }
+
+  const teacherSql = `
+    SELECT teacher_id
+    FROM ${teachersTable}
+    WHERE teacher_id = ?
+      AND (? IS NULL OR client_id = ?)
+    LIMIT 1
+  `;
+
+  pool.query(teacherSql, [teacherId, clientId || null, clientId || null], (teacherError, teachers) => {
+    if (teacherError) {
+      return sendDatabaseError(res, teacherError);
+    }
+
+    if (!teachers.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'Choose a valid teacher for this client'
+      });
+    }
+
+    const scheduleSql = `
+      SELECT schedule_id
+      FROM ${schedulesTable}
+      WHERE schedule_id = ?
+        AND (? IS NULL OR client_id = ?)
+      LIMIT 1
+    `;
+
+    pool.query(scheduleSql, [scheduleId, clientId || null, clientId || null], (scheduleError, schedules) => {
+      if (scheduleError) {
+        return sendDatabaseError(res, scheduleError);
+      }
+
+      if (!schedules.length) {
+        return res.status(404).json({
+          success: false,
+          message: 'Schedule assignment not found'
+        });
+      }
+
+      const columns = ['teacher_id = ?'];
+      const values = [teacherId];
+      const optionalFields = {
+        subject: 'subject',
+        grade: 'grade',
+        section: 'section',
+        status: 'status',
+        notes: 'notes'
+      };
+
+      Object.entries(optionalFields).forEach(([bodyKey, column]) => {
+        if (req.body[bodyKey] !== undefined) {
+          columns.push(`${column} = ?`);
+          values.push(normalizeString(req.body[bodyKey]));
+        }
+      });
+
+      values.push(scheduleId, clientId || null, clientId || null);
+
+      const updateSql = `
+        UPDATE ${schedulesTable}
+        SET ${columns.join(', ')}
+        WHERE schedule_id = ?
+          AND (? IS NULL OR client_id = ?)
+      `;
+
+      pool.query(updateSql, values, (updateError) => {
+        if (updateError) {
+          return sendDatabaseError(res, updateError);
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: 'Teacher assigned to class successfully'
+        });
+      });
+    });
+  });
+}
+
 function deleteSchedule(req, res) {
   pool.query(`DELETE FROM ${schedulesTable} WHERE schedule_id = ?`, [req.params.scheduleId], (error, result) => {
     if (error) {
@@ -646,6 +743,7 @@ module.exports = {
   getScheduleById,
   createSchedule,
   updateSchedule,
+  assignTeacherToSchedule,
   deleteSchedule,
   getStudentsForSchedule,
   getTeacherAttendance,
