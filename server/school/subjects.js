@@ -225,6 +225,33 @@ function updateSubject(req, res) {
   });
 }
 
+function getSubjectsDropdown(req, res) {
+  const clientId = req.query.client_id;
+  const conditions = [];
+  const values = [];
+
+  if (clientId) {
+    conditions.push('client_id = ?');
+    values.push(clientId);
+  }
+
+  const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const sql = `
+    SELECT subject_id, sub_name
+    FROM ${subjectsTable}
+    ${whereClause}
+    ORDER BY sub_name ASC
+  `;
+
+  pool.query(sql, values, (error, results) => {
+    if (error) {
+      return sendDatabaseError(res, error);
+    }
+
+    return res.status(200).json(results);
+  });
+}
+
 function deleteSubject(req, res) {
   pool.query(`DELETE FROM ${subjectsTable} WHERE subject_id = ?`, [req.params.subjectId], (error, result) => {
     if (error) {
@@ -250,5 +277,6 @@ module.exports = {
   getSubjectById,
   createSubject,
   updateSubject,
-  deleteSubject
+  deleteSubject,
+  getSubjectsDropdown
 };

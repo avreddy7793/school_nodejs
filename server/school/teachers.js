@@ -5,6 +5,8 @@ const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const globalDatabase = process.env.DB_GLOBAL_DATABASE || process.env.DB_DATABASE || 'global';
 const teachersTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teachers')}`;
 const userEntityLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('user_entity_links')}`;
+const teacherSubjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teacher_subjects')}`;
+const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('subjects')}`;
 const loginTable = `${escapeIdentifier(globalDatabase)}.${escapeIdentifier('login')}`;
 const rolesTable = `${escapeIdentifier(globalDatabase)}.${escapeIdentifier('roles')}`;
 const clientMasterTable = `${escapeIdentifier(globalDatabase)}.${escapeIdentifier('client_master')}`;
@@ -207,7 +209,137 @@ function buildTeacherUpdatePayload(body) {
   return payload;
 }
 
-function getTeachers(req, res) {
+function isMissingTableError(error) {
+  return Boolean(error) && (error.code === 'ER_NO_SUCH_TABLE' || error.errno === 1146);
+}
+
+function normalizeSubjectIds(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const list = Array.isArray(value) ? value : String(value).split(',');
+  const ids = [];
+
+  list.forEach((item) => {
+    const parsed = Number(item);
+    if (Number.isInteger(parsed) && parsed > 0 && !ids.includes(parsed)) {
+      ids.push(parsed);
+    }
+  });
+
+  return ids;
+}
+
+async function ensureTeacherSubjectsTable(connection) {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS ${teacherSubjectsTable} (
+      id int NOT NULL AUTO_INCREMENT,
+      client_id bigint DEFAULT NULL,
+      teacher_id int NOT NULL,
+      subject_id int NOT NULL,
+      status enum('Active','Inactive') NOT NULL DEFAULT 'Active',
+      created_at timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_teacher_subject (teacher_id, subject_id),
+      KEY idx_teacher_subjects_client_id (client_id),
+      KEY idx_teacher_subjects_teacher_id (teacher_id),
+      KEY idx_teacher_subjects_subject_id (subject_id),
+      CONSTRAINT fk_teacher_subjects_teacher FOREIGN KEY (teacher_id) REFERENCES ${teachersTable} (teacher_id) ON DELETE CASCADE,
+      CONSTRAINT fk_teacher_subjects_subject FOREIGN KEY (subject_id) REFERENCES ${subjectsTable} (subject_id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+}
+
+async function fetchSubjectsForTeachers(connection, teacherIds) {
+  const map = {};
+  if (!teacherIds.length) {
+    return map;
+  }
+
+  try {
+    const [rows] = await connection.query(
+      `SELECT ts.teacher_id, s.subject_id, s.sub_name
+       FROM ${teacherSubjectsTable} ts
+       JOIN ${subjectsTable} s ON s.subject_id = ts.subject_id
+       WHERE ts.status = 'Active' AND ts.teacher_id IN (?)
+       ORDER BY s.sub_name ASC`,
+      [teacherIds]
+    );
+
+    rows.forEach((row) => {
+      if (!map[row.teacher_id]) {
+        map[row.teacher_id] = [];
+      }
+      map[row.teacher_id].push({ subject_id: row.subject_id, sub_name: row.sub_name });
+    });
+  } catch (error) {
+    if (!isMissingTableError(error)) {
+      throw error;
+    }
+  }
+
+  return map;
+}
+
+async function teacherUsedInTable(connection, tableName, teacherId) {
+  const targetTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier(tableName)}`;
+
+  try {
+    const [rows] = await connection.query(
+      `SELECT 1 FROM ${targetTable} WHERE teacher_id = ? LIMIT 1`,
+      [teacherId]
+    );
+    return rows.length > 0;
+  } catch (error) {
+    if (isMissingTableError(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+// Syncs teacher_subjects rows for a teacher and refreshes the
+// subjects_taught text column for backward compatibility.
+async function syncTeacherSubjects(connection, teacherId, subjectIds, clientId) {
+  await ensureTeacherSubjectsTable(connection);
+
+  let subjectNames = [];
+
+  if (subjectIds.length) {
+    const [subjects] = await connection.query(
+      `SELECT subject_id, sub_name FROM ${subjectsTable} WHERE subject_id IN (?)`,
+      [subjectIds]
+    );
+
+    if (subjects.length !== subjectIds.length) {
+      const error = new Error('One or more selected subjects do not exist');
+      error.code = 'INVALID_SUBJECT_IDS';
+      throw error;
+    }
+
+    const nameById = new Map(subjects.map((subject) => [subject.subject_id, subject.sub_name]));
+    subjectNames = subjectIds.map((id) => nameById.get(id)).filter(Boolean);
+  }
+
+  await connection.query(`DELETE FROM ${teacherSubjectsTable} WHERE teacher_id = ?`, [teacherId]);
+
+  if (subjectIds.length) {
+    const rows = subjectIds.map((subjectId) => [clientId || null, teacherId, subjectId, 'Active']);
+    await connection.query(
+      `INSERT INTO ${teacherSubjectsTable} (client_id, teacher_id, subject_id, status) VALUES ?`,
+      [rows]
+    );
+  }
+
+  await connection.query(
+    `UPDATE ${teachersTable} SET subjects_taught = ? WHERE teacher_id = ?`,
+    [subjectNames.join(', '), teacherId]
+  );
+}
+
+async function getTeachers(req, res) {
   const { client_id, department, employment_status, search } = req.query;
   const conditions = [];
   const values = [];
@@ -236,25 +368,37 @@ function getTeachers(req, res) {
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const sql = `SELECT ${selectableColumns} FROM ${teachersTable} ${whereClause} ORDER BY updated_at DESC`;
 
-  pool.query(sql, values, (error, results) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  const connection = await pool.promise().getConnection();
+
+  try {
+    const [results] = await connection.query(sql, values);
+    const teacherIds = results.map((teacher) => teacher.teacher_id);
+    const subjectsByTeacher = await fetchSubjectsForTeachers(connection, teacherIds);
+
+    const data = results.map((teacher) => ({
+      ...teacher,
+      subjects: subjectsByTeacher[teacher.teacher_id] || []
+    }));
 
     return res.status(200).json({
       success: true,
-      data: results
+      data
     });
-  });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
 }
 
-function getTeacherById(req, res) {
+async function getTeacherById(req, res) {
+  const { teacherId } = req.params;
   const sql = `SELECT ${selectableColumns} FROM ${teachersTable} WHERE teacher_id = ?`;
 
-  pool.query(sql, [req.params.teacherId], (error, results) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  const connection = await pool.promise().getConnection();
+
+  try {
+    const [results] = await connection.query(sql, [teacherId]);
 
     if (!results.length) {
       return res.status(404).json({
@@ -263,11 +407,22 @@ function getTeacherById(req, res) {
       });
     }
 
+    const subjectsByTeacher = await fetchSubjectsForTeachers(connection, [results[0].teacher_id]);
+    const subjects = subjectsByTeacher[results[0].teacher_id] || [];
+
     return res.status(200).json({
       success: true,
-      data: results[0]
+      data: {
+        ...results[0],
+        subjects,
+        subject_ids: subjects.map((subject) => subject.subject_id)
+      }
     });
-  });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
 }
 
 async function ensureUserEntityLinksTable(connection) {
@@ -392,6 +547,11 @@ async function createTeacher(req, res) {
     const [result] = await connection.query(`INSERT INTO ${teachersTable} SET ?`, payload);
     const login = await createTeacherLogin(connection, payload, result.insertId, loginOptions);
 
+    const subjectIds = normalizeSubjectIds(getValue(req.body, 'subjectIds') ?? req.body.subject_ids);
+    if (subjectIds !== null) {
+      await syncTeacherSubjects(connection, result.insertId, subjectIds, payload.client_id);
+    }
+
     await connection.commit();
     return res.status(201).json({
       success: true,
@@ -416,65 +576,195 @@ async function createTeacher(req, res) {
       });
     }
 
+    if (error.code === 'INVALID_SUBJECT_IDS') {
+      return res.status(400).json({
+        success: false,
+        message: 'One or more selected subjects do not exist'
+      });
+    }
+
     return sendDatabaseError(res, error);
   } finally {
     connection.release();
   }
 }
 
-function updateTeacher(req, res) {
+async function updateTeacher(req, res) {
+  const teacherId = req.params.teacherId;
   const payload = buildTeacherUpdatePayload(req.body);
   delete payload.created_by;
 
+  const requiredFields = ['first_name', 'last_name', 'email', 'phone_number', 'date_of_birth', 'date_of_joining', 'gender'];
+  const emptyRequiredField = requiredFields.find((field) => {
+    if (!(field in payload)) {
+      return false;
+    }
+    const value = payload[field];
+    return value === null || value === undefined || String(value).trim() === '';
+  });
+
+  if (emptyRequiredField) {
+    return res.status(400).json({
+      success: false,
+      message: `${emptyRequiredField} cannot be empty`
+    });
+  }
+
+  const subjectIds = normalizeSubjectIds(getValue(req.body, 'subjectIds') ?? req.body.subject_ids);
   const updates = Object.entries(payload).filter(([, value]) => value !== undefined);
-  if (!updates.length) {
+
+  if (!updates.length && subjectIds === null) {
     return res.status(400).json({
       success: false,
       message: 'No update data supplied'
     });
   }
 
-  const columns = updates.map(([key]) => `${key} = ?`);
-  const values = updates.map(([, value]) => value);
-  values.push(req.params.teacherId);
+  const connection = await pool.promise().getConnection();
 
-  pool.query(`UPDATE ${teachersTable} SET ${columns.join(', ')} WHERE teacher_id = ?`, values, (error, result) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  try {
+    await connection.beginTransaction();
 
-    if (!result.affectedRows) {
+    const [existingRows] = await connection.query(
+      `SELECT teacher_id, client_id FROM ${teachersTable} WHERE teacher_id = ?`,
+      [teacherId]
+    );
+
+    if (!existingRows.length) {
+      await connection.rollback();
       return res.status(404).json({
         success: false,
         message: 'Teacher not found'
       });
     }
+
+    if (payload.email) {
+      const [emailRows] = await connection.query(
+        `SELECT teacher_id FROM ${teachersTable} WHERE email = ? AND teacher_id <> ? LIMIT 1`,
+        [payload.email, teacherId]
+      );
+
+      if (emailRows.length) {
+        await connection.rollback();
+        return res.status(409).json({
+          success: false,
+          message: 'Email already exists for another teacher'
+        });
+      }
+    }
+
+    if (updates.length) {
+      const columns = updates.map(([key]) => `${key} = ?`);
+      const updateValues = updates.map(([, value]) => value);
+      updateValues.push(teacherId);
+      await connection.query(`UPDATE ${teachersTable} SET ${columns.join(', ')} WHERE teacher_id = ?`, updateValues);
+    }
+
+    if (subjectIds !== null) {
+      const clientId = payload.client_id ?? existingRows[0].client_id;
+      await syncTeacherSubjects(connection, Number(teacherId), subjectIds, clientId);
+    }
+
+    await connection.commit();
 
     return res.status(200).json({
       success: true,
       message: 'Teacher updated successfully'
     });
-  });
-}
+  } catch (error) {
+    await connection.rollback();
 
-function deleteTeacher(req, res) {
-  pool.query(`DELETE FROM ${teachersTable} WHERE teacher_id = ?`, [req.params.teacherId], (error, result) => {
-    if (error) {
-      return sendDatabaseError(res, error);
+    if (error.code === 'INVALID_SUBJECT_IDS') {
+      return res.status(400).json({
+        success: false,
+        message: 'One or more selected subjects do not exist'
+      });
     }
 
-    if (!result.affectedRows) {
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
+}
+
+async function deleteTeacher(req, res) {
+  const teacherId = req.params.teacherId;
+  const connection = await pool.promise().getConnection();
+
+  try {
+    const [existingRows] = await connection.query(
+      `SELECT teacher_id FROM ${teachersTable} WHERE teacher_id = ?`,
+      [teacherId]
+    );
+
+    if (!existingRows.length) {
       return res.status(404).json({
         success: false,
         message: 'Teacher not found'
       });
+    }
+
+    const dependencyTables = ['class_schedule', 'classroom_sessions', 'teacher_subject_assignments', 'teacher_attendance'];
+    let isUsed = false;
+
+    for (const tableName of dependencyTables) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await teacherUsedInTable(connection, tableName, teacherId)) {
+        isUsed = true;
+        break;
+      }
+    }
+
+    if (isUsed) {
+      await connection.query(
+        `UPDATE ${teachersTable} SET employment_status = 'Inactive' WHERE teacher_id = ?`,
+        [teacherId]
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: 'Teacher is already used in schedules or attendance, so marked as inactive.'
+      });
+    }
+
+    await connection.beginTransaction();
+
+    try {
+      try {
+        await connection.query(`DELETE FROM ${teacherSubjectsTable} WHERE teacher_id = ?`, [teacherId]);
+      } catch (error) {
+        if (!isMissingTableError(error)) {
+          throw error;
+        }
+      }
+
+      try {
+        await connection.query(
+          `DELETE FROM ${userEntityLinksTable} WHERE entity_type = 'TEACHER' AND entity_id = ?`,
+          [teacherId]
+        );
+      } catch (error) {
+        if (!isMissingTableError(error)) {
+          throw error;
+        }
+      }
+
+      await connection.query(`DELETE FROM ${teachersTable} WHERE teacher_id = ?`, [teacherId]);
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
     }
 
     return res.status(200).json({
       success: true,
       message: 'Teacher deleted successfully'
     });
-  });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
 }
 
 module.exports = {
