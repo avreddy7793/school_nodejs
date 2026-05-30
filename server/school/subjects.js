@@ -138,6 +138,33 @@ function getSubjects(req, res) {
   });
 }
 
+function getSubjectsDropdown(req, res) {
+  const { client_id } = req.query;
+  const conditions = [];
+  const values = [];
+
+  if (client_id) {
+    conditions.push('client_id = ?');
+    values.push(client_id);
+  }
+
+  const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const sql = `
+    SELECT subject_id, sub_name
+    FROM ${subjectsTable}
+    ${whereClause}
+    ORDER BY sub_name ASC
+  `;
+
+  pool.query(sql, values, (error, results) => {
+    if (error) {
+      return sendDatabaseError(res, error);
+    }
+
+    return res.status(200).json(results);
+  });
+}
+
 function getSubjectById(req, res) {
   const clientId = req.query.client_id;
   const sql = `
@@ -247,6 +274,7 @@ function deleteSubject(req, res) {
 
 module.exports = {
   getSubjects,
+  getSubjectsDropdown,
   getSubjectById,
   createSubject,
   updateSubject,

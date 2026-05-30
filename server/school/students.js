@@ -5,6 +5,7 @@ const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const globalDatabase = process.env.DB_GLOBAL_DATABASE || process.env.DB_DATABASE || 'global';
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
+const sectionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('sections')}`;
 const userEntityLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('user_entity_links')}`;
 const parentStudentLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('parent_student_links')}`;
 const loginTable = `${escapeIdentifier(globalDatabase)}.${escapeIdentifier('login')}`;
@@ -146,6 +147,15 @@ function normalizeText(value) {
   return trimmed || null;
 }
 
+function normalizePositiveInteger(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
 function normalizeBoolean(value, fallback = true) {
   if (value === undefined || value === null || value === '') {
     return fallback;
@@ -201,7 +211,7 @@ function buildStudentPayload(body) {
   return {
     client_id: getValue(body, 'clientId'),
     yearly_fee: getValue(body, 'yearlyFee'),
-    admission_number: getValue(body, 'admissionNumber', `ADM${Date.now()}`),
+    admission_number: getValue(body, 'admissionNumber'),
     first_name: getValue(body, 'firstName'),
     middle_name: getValue(body, 'middleName'),
     last_name: getValue(body, 'lastName'),
@@ -254,6 +264,208 @@ function buildStudentPayload(body) {
     created_by: getValue(body, 'createdBy'),
     updated_by: getValue(body, 'updatedBy')
   };
+}
+
+function normalizeAdmissionPart(value, fallback) {
+  const normalized = normalizeText(value) || fallback;
+  return String(normalized)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '')
+    .slice(0, 16) || fallback;
+}
+
+function currentAcademicYear() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1;
+  const startYear = month >= 4 ? year : year - 1;
+  return `${startYear}-${String(startYear + 1).slice(-2)}`;
+}
+
+async function getClassroomName(connection, classroomId) {
+  if (!classroomId) {
+    return null;
+  }
+
+  const [rows] = await connection.query(
+    `SELECT name FROM ${classroomsTable} WHERE classroom_id = ? LIMIT 1`,
+    [classroomId]
+  );
+
+  return rows[0]?.name || null;
+}
+
+async function getSectionMetadata(connection) {
+  const [columns] = await connection.query(`SHOW COLUMNS FROM ${sectionsTable}`);
+  const columnNames = new Set(columns.map((column) => column.Field));
+  return {
+    names: columnNames,
+    nameColumn: ['name', 'section_name', 'section', 'label'].find((column) => columnNames.has(column)) || null
+  };
+}
+
+async function validateClassAndSection(connection, payload) {
+  const classroomId = normalizePositiveInteger(payload.class_name);
+  const sectionName = normalizeText(payload.section);
+
+  if (!classroomId) {
+    const error = new Error('Class is required.');
+    error.code = 'STUDENT_VALIDATION';
+    throw error;
+  }
+
+  const [classrooms] = await connection.query(
+    `SELECT classroom_id, name FROM ${classroomsTable} WHERE classroom_id = ? AND (? IS NULL OR client_id = ?) LIMIT 1`,
+    [classroomId, payload.client_id || null, payload.client_id || null]
+  );
+
+  if (!classrooms.length) {
+    const error = new Error('Selected class does not exist.');
+    error.code = 'STUDENT_VALIDATION';
+    throw error;
+  }
+
+  payload.class_name = classroomId;
+  payload.grade_level = payload.grade_level || classrooms[0].name;
+  payload.current_grade = payload.current_grade || classrooms[0].name;
+
+  if (!sectionName) {
+    const error = new Error('Section is required.');
+    error.code = 'STUDENT_VALIDATION';
+    throw error;
+  }
+
+  const sectionMeta = await getSectionMetadata(connection);
+  const sectionNameColumn = sectionMeta.nameColumn;
+  if (!sectionNameColumn) {
+    const error = new Error('Sections table must have a name, section_name, section, or label column.');
+    error.code = 'STUDENT_VALIDATION';
+    throw error;
+  }
+
+  const sectionWhere = [`LOWER(${escapeIdentifier(sectionNameColumn)}) = LOWER(?)`];
+  const sectionValues = [sectionName];
+
+  if (sectionMeta.names.has('classroom_id')) {
+    sectionWhere.unshift('classroom_id = ?');
+    sectionValues.unshift(classroomId);
+  }
+
+  if (sectionMeta.names.has('client_id')) {
+    sectionWhere.push('(? IS NULL OR client_id = ?)');
+    sectionValues.push(payload.client_id || null, payload.client_id || null);
+  }
+
+  if (sectionMeta.names.has('status')) {
+    sectionWhere.push("(status IS NULL OR status = 'Active')");
+  }
+
+  const [sections] = await connection.query(
+    `
+      SELECT 1 AS found
+      FROM ${sectionsTable}
+      WHERE ${sectionWhere.join(' AND ')}
+      LIMIT 1
+    `,
+    sectionValues
+  );
+
+  if (!sections.length) {
+    const error = new Error('Selected section does not belong to this class.');
+    error.code = 'STUDENT_VALIDATION';
+    throw error;
+  }
+}
+
+async function generateStudentAdmissionIdentity(connection, payload) {
+  const classroomId = normalizePositiveInteger(payload.class_name);
+  const academicYear = normalizeText(payload.academic_year) || currentAcademicYear();
+  const section = normalizeText(payload.section);
+  const classroomName = await getClassroomName(connection, classroomId);
+  const yearPart = normalizeAdmissionPart(academicYear, 'YEAR');
+  const classPart = normalizeAdmissionPart(classroomName || classroomId, 'CLASS');
+  const sectionPart = normalizeAdmissionPart(section, 'SEC');
+
+  const [rollRows] = await connection.query(
+    `
+      SELECT MAX(COALESCE(roll_number, 0)) AS max_roll
+      FROM ${studentsTable}
+      WHERE (? IS NULL OR client_id = ?)
+        AND class_name = ?
+        AND section = ?
+        AND academic_year = ?
+    `,
+    [payload.client_id || null, payload.client_id || null, classroomId, section, academicYear]
+  );
+
+  let serial = Number(rollRows[0]?.max_roll || 0) + 1;
+  let admissionNumber = '';
+
+  while (serial < 10000) {
+    admissionNumber = `${yearPart}-${classPart}-${sectionPart}-${String(serial).padStart(3, '0')}`;
+    const [existingRows] = await connection.query(
+      `SELECT student_id FROM ${studentsTable} WHERE admission_number = ? LIMIT 1`,
+      [admissionNumber]
+    );
+
+    if (!existingRows.length) {
+      return {
+        admissionNumber,
+        rollNumber: serial,
+        academicYear
+      };
+    }
+
+    serial += 1;
+  }
+
+  const error = new Error('Unable to generate a unique admission number for this class and section.');
+  error.code = 'STUDENT_VALIDATION';
+  throw error;
+}
+
+async function tableColumnExists(connection, tableName, columnName) {
+  const [rows] = await connection.query(
+    `
+      SELECT COLUMN_NAME
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = ?
+        AND TABLE_NAME = ?
+        AND COLUMN_NAME = ?
+      LIMIT 1
+    `,
+    [schoolDatabase, tableName, columnName]
+  );
+
+  return rows.length > 0;
+}
+
+async function countStudentReferences(connection, studentId) {
+  const referenceTables = [
+    'exam_results',
+    'student_attendance',
+    'attendance',
+    'fee_records',
+    'student_room_assignments',
+    'hostel_payments',
+    'unit_test_results'
+  ];
+  let total = 0;
+
+  for (const tableName of referenceTables) {
+    const hasStudentId = await tableColumnExists(connection, tableName, 'student_id');
+    if (!hasStudentId) {
+      continue;
+    }
+
+    const [rows] = await connection.query(
+      `SELECT COUNT(*) AS count FROM ${escapeIdentifier(schoolDatabase)}.${escapeIdentifier(tableName)} WHERE student_id = ?`,
+      [studentId]
+    );
+    total += Number(rows[0]?.count || 0);
+  }
+
+  return total;
 }
 
 function buildParentLoginOptions(body, payload) {
@@ -479,29 +691,48 @@ async function createParentLogin(connection, payload, studentId, loginOptions) {
   };
 }
 
-function getNextAdmissionNumber(req, res) {
-  pool.query(`SELECT admission_number FROM ${studentsTable}`, (error, results) => {
-    if (error) {
-      return sendDatabaseError(res, error);
+async function getNextAdmissionNumber(req, res) {
+  const connection = await pool.promise().getConnection();
+
+  try {
+    const payload = {
+      client_id: normalizePositiveInteger(req.query.client_id || req.query.clientId),
+      class_name: normalizePositiveInteger(req.query.classroom_id || req.query.className || req.query.class_name),
+      section: normalizeText(req.query.section),
+      academic_year: normalizeText(req.query.academic_year || req.query.academicYear) || currentAcademicYear()
+    };
+
+    if (!payload.class_name || !payload.section) {
+      return res.status(200).json({
+        success: true,
+        admissionNumber: '',
+        rollNumber: null,
+        academicYear: payload.academic_year,
+        message: 'Select class and section to generate admission number.'
+      });
     }
 
-    const maxNumber = results.reduce((max, row) => {
-      const match = String(row.admission_number || '').match(/(\d+)$/);
-      if (!match) {
-        return max;
-      }
-
-      return Math.max(max, Number(match[1]));
-    }, 0);
-
-    const nextNumber = maxNumber + 1;
-    const admissionNumber = `ADM${String(nextNumber).padStart(3, '0')}`;
+    await validateClassAndSection(connection, payload);
+    const identity = await generateStudentAdmissionIdentity(connection, payload);
 
     return res.status(200).json({
       success: true,
-      admissionNumber
+      admissionNumber: identity.admissionNumber,
+      rollNumber: identity.rollNumber,
+      academicYear: identity.academicYear
     });
-  });
+  } catch (error) {
+    if (error.code === 'STUDENT_VALIDATION') {
+      return res.status(400).json({
+        success: false,
+        message: error.message
+      });
+    }
+
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
 }
 
 function getStudents(req, res) {
@@ -582,10 +813,10 @@ async function createStudent(req, res) {
   const payload = buildStudentPayload(req.body);
   const parentLoginOptions = buildParentLoginOptions(req.body, payload);
 
-  if (!payload.first_name || !payload.last_name) {
+  if (!payload.first_name || !payload.last_name || !payload.date_of_birth || !payload.gender || !payload.admission_date || !payload.enrollment_status) {
     return res.status(400).json({
       success: false,
-      message: 'First name and last name are required'
+      message: 'First name, last name, date of birth, gender, admission date, and enrollment status are required'
     });
   }
 
@@ -594,15 +825,16 @@ async function createStudent(req, res) {
   try {
     await connection.beginTransaction();
 
-    if (!payload.admission_number) {
-      const [admissionRows] = await connection.query(`SELECT admission_number FROM ${studentsTable}`);
-      const maxNumber = admissionRows.reduce((max, row) => {
-        const match = String(row.admission_number || '').match(/(\d+)$/);
-        return match ? Math.max(max, Number(match[1])) : max;
-      }, 0);
+    await validateClassAndSection(connection, payload);
 
-      payload.admission_number = `ADM${String(maxNumber + 1).padStart(3, '0')}`;
+    if (!payload.academic_year) {
+      payload.academic_year = currentAcademicYear();
     }
+
+    const identity = await generateStudentAdmissionIdentity(connection, payload);
+    payload.admission_number = identity.admissionNumber;
+    payload.roll_number = identity.rollNumber;
+    payload.academic_year = identity.academicYear;
 
     const [result] = await connection.query(`INSERT INTO ${studentsTable} SET ?`, payload);
     const parentLogin = await createParentLogin(connection, payload, result.insertId, parentLoginOptions);
@@ -633,13 +865,20 @@ async function createStudent(req, res) {
       });
     }
 
+    if (error.code === 'STUDENT_VALIDATION') {
+      return res.status(400).json({
+        success: false,
+        message: error.message
+      });
+    }
+
     return sendDatabaseError(res, error);
   } finally {
     connection.release();
   }
 }
 
-function updateStudent(req, res) {
+async function updateStudent(req, res) {
   const payload = buildStudentUpdatePayload(req.body);
   delete payload.created_by;
 
@@ -651,34 +890,66 @@ function updateStudent(req, res) {
     });
   }
 
-  const columns = updates.map(([key]) => `${key} = ?`);
-  const values = updates.map(([, value]) => value);
-  values.push(req.params.studentId);
+  const connection = await pool.promise().getConnection();
 
-  pool.query(`UPDATE ${studentsTable} SET ${columns.join(', ')} WHERE student_id = ?`, values, (error, result) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  try {
+    await connection.beginTransaction();
 
-    if (!result.affectedRows) {
+    const [existingRows] = await connection.query(
+      `SELECT * FROM ${studentsTable} WHERE student_id = ? LIMIT 1`,
+      [req.params.studentId]
+    );
+
+    if (!existingRows.length) {
+      await connection.rollback();
       return res.status(404).json({
         success: false,
         message: 'Student not found'
       });
     }
+
+    const mergedPayload = {
+      ...existingRows[0],
+      ...payload
+    };
+
+    await validateClassAndSection(connection, mergedPayload);
+
+    const columns = updates.map(([key]) => `${key} = ?`);
+    const values = updates.map(([, value]) => value);
+    values.push(req.params.studentId);
+
+    await connection.query(`UPDATE ${studentsTable} SET ${columns.join(', ')} WHERE student_id = ?`, values);
+    await connection.commit();
 
     return res.status(200).json({
       success: true,
       message: 'Student updated successfully'
     });
-  });
+  } catch (error) {
+    await connection.rollback();
+
+    if (error.code === 'STUDENT_VALIDATION') {
+      return res.status(400).json({
+        success: false,
+        message: error.message
+      });
+    }
+
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
 }
 
-function deleteStudent(req, res) {
-  pool.query(`DELETE FROM ${studentsTable} WHERE student_id = ?`, [req.params.studentId], (error, result) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+async function deactivateStudent(req, res) {
+  const connection = await pool.promise().getConnection();
+
+  try {
+    const [result] = await connection.query(
+      `UPDATE ${studentsTable} SET enrollment_status = 'Inactive' WHERE student_id = ?`,
+      [req.params.studentId]
+    );
 
     if (!result.affectedRows) {
       return res.status(404).json({
@@ -689,9 +960,74 @@ function deleteStudent(req, res) {
 
     return res.status(200).json({
       success: true,
+      message: 'Student deactivated successfully'
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
+}
+
+async function deleteStudent(req, res) {
+  const connection = await pool.promise().getConnection();
+
+  try {
+    await connection.beginTransaction();
+
+    const [studentRows] = await connection.query(
+      `SELECT student_id FROM ${studentsTable} WHERE student_id = ? LIMIT 1`,
+      [req.params.studentId]
+    );
+
+    if (!studentRows.length) {
+      await connection.rollback();
+      return res.status(404).json({
+        success: false,
+        message: 'Student not found'
+      });
+    }
+
+    const referenceCount = await countStudentReferences(connection, req.params.studentId);
+    if (referenceCount > 0) {
+      await connection.query(
+        `UPDATE ${studentsTable} SET enrollment_status = 'Inactive' WHERE student_id = ?`,
+        [req.params.studentId]
+      );
+      await connection.commit();
+
+      return res.status(200).json({
+        success: true,
+        message: 'Student marked inactive because related records exist.'
+      });
+    }
+
+    if (await tableColumnExists(connection, 'parent_student_links', 'student_id')) {
+      await connection.query(
+        `DELETE FROM ${parentStudentLinksTable} WHERE student_id = ?`,
+        [req.params.studentId]
+      );
+    }
+
+    if (await tableColumnExists(connection, 'user_entity_links', 'entity_id')) {
+      await connection.query(
+        `DELETE FROM ${userEntityLinksTable} WHERE entity_type IN ('STUDENT', 'PARENT') AND entity_id = ?`,
+        [req.params.studentId]
+      );
+    }
+    await connection.query(`DELETE FROM ${studentsTable} WHERE student_id = ?`, [req.params.studentId]);
+    await connection.commit();
+
+    return res.status(200).json({
+      success: true,
       message: 'Student deleted successfully'
     });
-  });
+  } catch (error) {
+    await connection.rollback();
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
 }
 
 module.exports = {
@@ -700,5 +1036,6 @@ module.exports = {
   getStudentById,
   createStudent,
   updateStudent,
+  deactivateStudent,
   deleteStudent
 };
