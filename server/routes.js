@@ -15,6 +15,7 @@ const transportsRouter = require("./school/transports.router");
 const teacherLeavesRouter = require("./school/teacher-leaves.router");
 const hostelRouter = require("./school/hostel.router");
 const portalRouter = require("./school/portal.router");
+const timetableRouter = require("./school/timetable.router");
 
 const multer = require('multer');
 const storage = multer.diskStorage({
@@ -30,7 +31,7 @@ module.exports = function (app) {
   app.all("/", function (req, res, next) {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Credentials", "true");
-    res.header("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS,POST,PUT");
+    res.header("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS,POST,PUT,DELETE");
     res.header(
       "Access-Control-Allow-Headers",
       "Access-Control-Allow-Headers, Origin,Accept, X-Requested-With, Content-Type, Access-Control-Request-Method, Access-Control-Request-Headers"
@@ -39,6 +40,8 @@ module.exports = function (app) {
   });
 
   app.post("/api/login", userdb.login);
+  app.use("/api", timetableRouter);
+  app.use("/api/school", timetableRouter);
   app.use("/api/school/students", studentsRouter);
   app.use("/api/students", studentsRouter);
   app.use("/api/school/teachers", teachersRouter);
