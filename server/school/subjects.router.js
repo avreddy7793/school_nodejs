@@ -4,6 +4,7 @@ const subjects = require('./subjects');
 const router = express.Router();
 
 router.get('/', subjects.getSubjects);
+router.get('/dropdown', subjects.getSubjectsDropdown);
 router.get('/:subjectId', subjects.getSubjectById);
 router.post('/', subjects.createSubject);
 router.put('/:subjectId', subjects.updateSubject);

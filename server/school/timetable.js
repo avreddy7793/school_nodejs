@@ -643,6 +643,250 @@ async function getSections(req, res) {
   return res.status(200).json({ success: true, data: rows });
 }
 
+function sectionNameColumn(sectionsMeta) {
+  return firstColumn(sectionsMeta, ['name', 'section_name', 'section', 'label']);
+}
+
+function parseSectionNames(body = {}) {
+  const rawValue =
+    body.sectionNames !== undefined ? body.sectionNames :
+      body.section_names !== undefined ? body.section_names :
+        body.sections !== undefined ? body.sections :
+          body.name !== undefined ? body.name :
+            body.sectionName !== undefined ? body.sectionName :
+              body.section_name !== undefined ? body.section_name :
+                body.section;
+
+  const rawItems = Array.isArray(rawValue) ? rawValue : String(rawValue || '').split(',');
+  const seen = new Set();
+
+  return rawItems
+    .map((value) => normalizeString(value))
+    .filter(Boolean)
+    .filter((value) => {
+      const key = value.toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+}
+
+function buildSectionPayload(req, sectionsMeta, name, existing = {}) {
+  const body = req.body || {};
+  const nameColumn = sectionNameColumn(sectionsMeta);
+  const payload = {
+    client_id: clientIdFrom(req) || existing.client_id,
+    classroom_id: normalizePositiveInteger(getValue(body, 'classroomId', 'classroom_id', existing.classroom_id)),
+    status: normalizeStatus(getValue(body, 'status', 'status', existing.status || 'Active'))
+  };
+
+  if (nameColumn) {
+    payload[nameColumn] = name || normalizeString(existing[nameColumn]);
+  }
+
+  return pickPayload(sectionsMeta, payload);
+}
+
+async function validateSectionPayload(payload, sectionsMeta) {
+  const nameColumn = sectionNameColumn(sectionsMeta);
+
+  if (!nameColumn) {
+    return 'Sections table must have a name, section_name, section, or label column.';
+  }
+
+  if (!payload[nameColumn]) {
+    return 'Section name is required.';
+  }
+
+  if (hasColumn(sectionsMeta, 'classroom_id') && !payload.classroom_id) {
+    return 'Classroom is required.';
+  }
+
+  if (payload.classroom_id) {
+    const basics = await getTableBasics();
+    const classroomExists = await existsById('classrooms', basics.classroomId, payload.classroom_id);
+    if (!classroomExists) {
+      return 'Classroom must exist.';
+    }
+  }
+
+  return null;
+}
+
+async function sectionDuplicateMessage(payload, sectionsMeta, ignoreId = null) {
+  const nameColumn = sectionNameColumn(sectionsMeta);
+  if (!nameColumn) {
+    return null;
+  }
+
+  const sectionId = primaryColumn(sectionsMeta, ['section_id', 'id']);
+  const where = [`LOWER(${escapeIdentifier(nameColumn)}) = LOWER(?)`];
+  const values = [payload[nameColumn]];
+
+  if (hasColumn(sectionsMeta, 'classroom_id')) {
+    where.push('classroom_id = ?');
+    values.push(payload.classroom_id);
+  }
+
+  if (hasColumn(sectionsMeta, 'client_id') && payload.client_id) {
+    where.push('client_id = ?');
+    values.push(payload.client_id);
+  }
+
+  if (hasColumn(sectionsMeta, 'status')) {
+    where.push('status = ?');
+    values.push('Active');
+  }
+
+  if (ignoreId) {
+    where.push(`${escapeIdentifier(sectionId)} <> ?`);
+    values.push(ignoreId);
+  }
+
+  const [rows] = await database().query(
+    `
+      SELECT ${escapeIdentifier(sectionId)}
+      FROM ${table('sections')}
+      WHERE ${where.join(' AND ')}
+      LIMIT 1
+    `,
+    values
+  );
+
+  return rows.length ? 'This class already has this section.' : null;
+}
+
+async function createSection(req, res) {
+  const sectionsMeta = await getColumns('sections');
+  const names = parseSectionNames(req.body);
+
+  if (!names.length) {
+    return res.status(400).json({ success: false, message: 'At least one section name is required.' });
+  }
+
+  const createdIds = [];
+  const skipped = [];
+
+  for (const name of names) {
+    const payload = buildSectionPayload(req, sectionsMeta, name);
+    const validationError = await validateSectionPayload(payload, sectionsMeta);
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
+    }
+
+    const duplicateError = await sectionDuplicateMessage(payload, sectionsMeta);
+    if (duplicateError) {
+      skipped.push(name);
+      continue;
+    }
+
+    createdIds.push(await insertRow('sections', payload));
+  }
+
+  if (!createdIds.length && skipped.length) {
+    return res.status(409).json({
+      success: false,
+      message: 'All selected sections already exist for this class.',
+      skipped
+    });
+  }
+
+  return res.status(201).json({
+    success: true,
+    message: skipped.length
+      ? 'Sections created. Existing sections were skipped.'
+      : 'Class sections created successfully.',
+    ids: createdIds,
+    skipped
+  });
+}
+
+async function updateSection(req, res) {
+  const sectionsMeta = await getColumns('sections');
+  const sectionId = primaryColumn(sectionsMeta, ['section_id', 'id']);
+  const id = normalizePositiveInteger(req.params.id);
+  const existing = id ? await findById('sections', sectionId, id) : null;
+
+  if (!existing) {
+    return res.status(404).json({ success: false, message: 'Section not found.' });
+  }
+
+  const names = parseSectionNames(req.body);
+  const payload = buildSectionPayload(req, sectionsMeta, names[0] || null, existing);
+  const validationError = await validateSectionPayload(payload, sectionsMeta);
+  if (validationError) {
+    return res.status(400).json({ success: false, message: validationError });
+  }
+
+  const duplicateError = await sectionDuplicateMessage(payload, sectionsMeta, id);
+  if (duplicateError) {
+    return res.status(409).json({ success: false, message: duplicateError });
+  }
+
+  const affectedRows = await updateRow('sections', sectionId, id, payload);
+  if (!affectedRows) {
+    return res.status(404).json({ success: false, message: 'Section not found.' });
+  }
+
+  return res.status(200).json({ success: true, message: 'Class section updated successfully.' });
+}
+
+async function deleteSection(req, res) {
+  const [sectionsMeta, assignmentMeta, scheduleMeta] = await Promise.all([
+    getColumns('sections'),
+    getColumns('teacher_subject_assignments'),
+    getColumns('class_schedule')
+  ]);
+  const sectionId = primaryColumn(sectionsMeta, ['section_id', 'id']);
+  const id = normalizePositiveInteger(req.params.id);
+
+  if (!id) {
+    return res.status(400).json({ success: false, message: 'Section id is required.' });
+  }
+
+  const usageQueries = [];
+  const values = [];
+
+  if (hasColumn(assignmentMeta, 'section_id')) {
+    usageQueries.push(`SELECT COUNT(*) AS count FROM ${table('teacher_subject_assignments')} WHERE section_id = ?`);
+    values.push(id);
+  }
+
+  if (hasColumn(scheduleMeta, 'section_id')) {
+    usageQueries.push(`SELECT COUNT(*) AS count FROM ${table('class_schedule')} WHERE section_id = ?`);
+    values.push(id);
+  }
+
+  if (usageQueries.length) {
+    const [usageRows] = await database().query(usageQueries.join(' UNION ALL '), values);
+    const isUsed = usageRows.some((row) => Number(row.count) > 0);
+
+    if (isUsed && hasColumn(sectionsMeta, 'status')) {
+      await updateRow('sections', sectionId, id, { status: 'Inactive' });
+      return res.status(200).json({
+        success: true,
+        message: 'Section marked inactive because timetable records exist.'
+      });
+    }
+
+    if (isUsed) {
+      return res.status(409).json({
+        success: false,
+        message: 'This section is used in timetable records and cannot be deleted.'
+      });
+    }
+  }
+
+  const affectedRows = await deleteRow('sections', sectionId, id);
+  if (!affectedRows) {
+    return res.status(404).json({ success: false, message: 'Section not found.' });
+  }
+
+  return res.status(200).json({ success: true, message: 'Class section deleted successfully.' });
+}
+
 async function getSessionPeriods(req, res) {
   const periodsMeta = await getColumns('session_periods');
   const conditions = [];
@@ -936,6 +1180,9 @@ async function getDaySchedule(req, res) {
 
 module.exports = {
   getSections: asyncHandler(getSections),
+  createSection: asyncHandler(createSection),
+  updateSection: asyncHandler(updateSection),
+  deleteSection: asyncHandler(deleteSection),
   getSessionPeriods: asyncHandler(getSessionPeriods),
   getTeacherSubjectAssignments: asyncHandler(getTeacherSubjectAssignments),
   createTeacherSubjectAssignment: asyncHandler(createTeacherSubjectAssignment),

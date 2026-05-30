@@ -4,6 +4,9 @@ const timetable = require('./timetable');
 const router = express.Router();
 
 router.get('/sections', timetable.getSections);
+router.post('/sections', timetable.createSection);
+router.put('/sections/:id', timetable.updateSection);
+router.delete('/sections/:id', timetable.deleteSection);
 router.get('/session-periods', timetable.getSessionPeriods);
 
 router.get('/teacher-subject-assignments', timetable.getTeacherSubjectAssignments);
