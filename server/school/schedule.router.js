@@ -55,6 +55,8 @@ router.get('/periods', schedule.getPeriods);
 router.post('/periods', assignmentAccess, schedule.createPeriod);
 router.get('/teacher-attendance', schedule.getTeacherAttendance);
 router.post('/teacher-attendance', schedule.saveTeacherAttendance);
+router.get('/student-attendance/settings', schedule.getStudentAttendanceSettings);
+router.put('/student-attendance/settings', assignmentAccess, schedule.updateStudentAttendanceSettings);
 router.get('/student-attendance', schedule.getStudentAttendance);
 router.post('/student-attendance', schedule.saveStudentAttendance);
 router.get('/', schedule.getSchedules);

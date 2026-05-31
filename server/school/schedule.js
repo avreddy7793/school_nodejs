@@ -11,6 +11,12 @@ const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('s
 const teacherAttendanceTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teacher_attendance')}`;
 const studentAttendanceTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('student_attendance')}`;
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
+const attendanceSettingsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('attendance_settings')}`;
+const STUDENT_ATTENDANCE_MODE_KEY = 'student_attendance_mode';
+const STUDENT_ATTENDANCE_MODES = new Set(['SESSION_WISE', 'PERIOD_WISE']);
+const STUDENT_ATTENDANCE_SESSIONS = new Set(['Session', 'Period', 'Morning', 'Afternoon']);
+let studentAttendanceSchemaReady = null;
+let teacherAttendanceSchemaReady = null;
 
 function escapeIdentifier(value) {
   return `\`${String(value).replace(/`/g, '``')}\``;
@@ -40,6 +46,66 @@ function normalizeString(value) {
 function normalizePositiveInteger(value) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeDayOfWeek(value) {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return null;
+  }
+
+  const numericDay = normalizePositiveInteger(normalized);
+  if (numericDay && numericDay <= 7) {
+    return numericDay;
+  }
+
+  const dayMap = {
+    MONDAY: 1,
+    TUESDAY: 2,
+    WEDNESDAY: 3,
+    THURSDAY: 4,
+    FRIDAY: 5,
+    SATURDAY: 6,
+    SUNDAY: 7
+  };
+
+  return dayMap[normalized.toUpperCase()] || null;
+}
+
+function normalizeAttendanceMode(value) {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return 'PERIOD_WISE';
+  }
+
+  const key = normalized.toUpperCase().replace(/[\s-]+/g, '_');
+  if (key === 'MORNING_SESSION' || key === 'AFTERNOON_SESSION' || key === 'SESSION') {
+    return 'SESSION_WISE';
+  }
+
+  return STUDENT_ATTENDANCE_MODES.has(key) ? key : 'PERIOD_WISE';
+}
+
+function normalizeAttendanceSession(value) {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return 'Period';
+  }
+
+  const key = normalized.toUpperCase().replace(/[\s-]+/g, '_');
+  const sessionMap = {
+    SESSION: 'Session',
+    SESSION_WISE: 'Session',
+    MORNING: 'Morning',
+    MORNING_SESSION: 'Morning',
+    AFTERNOON: 'Afternoon',
+    AFTERNOON_SESSION: 'Afternoon',
+    PERIOD: 'Period',
+    PERIOD_WISE: 'Period'
+  };
+
+  const mapped = sessionMap[key];
+  return mapped && STUDENT_ATTENDANCE_SESSIONS.has(mapped) ? mapped : 'Period';
 }
 
 function getValue(body, key, fallback = undefined) {
@@ -76,6 +142,133 @@ function buildAttendancePayload(body) {
     notes: normalizeString(getValue(body, 'notes')),
     marked_by: getValue(body, 'markedBy', null)
   };
+}
+
+function ensureAttendanceSettingsTable(callback) {
+  const sql = `
+    CREATE TABLE IF NOT EXISTS ${attendanceSettingsTable} (
+      setting_id INT NOT NULL AUTO_INCREMENT,
+      client_id BIGINT NOT NULL,
+      setting_key VARCHAR(80) NOT NULL,
+      setting_value VARCHAR(80) NOT NULL,
+      created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (setting_id),
+      UNIQUE KEY uq_attendance_settings_client_key (client_id, setting_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `;
+
+  pool.query(sql, callback);
+}
+
+function queryAsync(sql, values = []) {
+  return new Promise((resolve, reject) => {
+    pool.query(sql, values, (error, results) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(results);
+    });
+  });
+}
+
+function ensureStudentAttendanceSchema() {
+  if (!studentAttendanceSchemaReady) {
+    studentAttendanceSchemaReady = (async () => {
+      const attendanceSessionColumn = await queryAsync(`SHOW COLUMNS FROM ${studentAttendanceTable} LIKE ?`, ['attendance_session']);
+      if (!attendanceSessionColumn.length) {
+        await queryAsync(`
+          ALTER TABLE ${studentAttendanceTable}
+          ADD COLUMN attendance_session VARCHAR(20) NOT NULL DEFAULT 'Period' AFTER attendance_date
+        `);
+      }
+
+      const markedByTeacherColumn = await queryAsync(`SHOW COLUMNS FROM ${studentAttendanceTable} LIKE ?`, ['marked_by_teacher_id']);
+      if (!markedByTeacherColumn.length) {
+        await queryAsync(`
+          ALTER TABLE ${studentAttendanceTable}
+          ADD COLUMN marked_by_teacher_id INT DEFAULT NULL AFTER marked_by
+        `);
+      }
+
+      const sessionUniqueIndex = await queryAsync(`SHOW INDEX FROM ${studentAttendanceTable} WHERE Key_name = ?`, ['uq_student_attendance_session']);
+      if (!sessionUniqueIndex.length) {
+        await queryAsync(`
+          ALTER TABLE ${studentAttendanceTable}
+          ADD UNIQUE KEY uq_student_attendance_session (schedule_id, student_id, attendance_date, attendance_session)
+        `);
+      }
+
+      const oldUniqueIndex = await queryAsync(`SHOW INDEX FROM ${studentAttendanceTable} WHERE Key_name = ?`, ['uq_student_attendance']);
+      if (oldUniqueIndex.length) {
+        await queryAsync(`ALTER TABLE ${studentAttendanceTable} DROP INDEX uq_student_attendance`);
+      }
+    })().catch((error) => {
+      studentAttendanceSchemaReady = null;
+      throw error;
+    });
+  }
+
+  return studentAttendanceSchemaReady;
+}
+
+function ensureTeacherAttendanceSchema() {
+  if (!teacherAttendanceSchemaReady) {
+    teacherAttendanceSchemaReady = (async () => {
+      const columns = await queryAsync(`SHOW COLUMNS FROM ${teacherAttendanceTable}`);
+      const columnNames = new Set(columns.map((column) => column.Field));
+      const hadCheckInTime = columnNames.has('check_in_time');
+      const hadRemarks = columnNames.has('remarks');
+
+      if (!columnNames.has('client_id')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN client_id BIGINT DEFAULT NULL AFTER attendance_id`);
+      }
+
+      if (!columnNames.has('schedule_id')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN schedule_id INT DEFAULT NULL AFTER client_id`);
+      }
+
+      if (!columnNames.has('check_in')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN check_in TIME DEFAULT NULL AFTER status`);
+
+        if (hadCheckInTime) {
+          await queryAsync(`UPDATE ${teacherAttendanceTable} SET check_in = check_in_time WHERE check_in IS NULL`);
+        }
+      }
+
+      if (!columnNames.has('notes')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN notes TEXT DEFAULT NULL AFTER check_in`);
+
+        if (hadRemarks) {
+          await queryAsync(`UPDATE ${teacherAttendanceTable} SET notes = remarks WHERE notes IS NULL`);
+        }
+      }
+
+      if (!columnNames.has('marked_by')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN marked_by INT DEFAULT NULL AFTER notes`);
+      }
+
+      await queryAsync(`
+        ALTER TABLE ${teacherAttendanceTable}
+        MODIFY status ENUM('Present','Late','Absent','On Leave') NOT NULL
+      `);
+
+      const uniqueIndex = await queryAsync(`SHOW INDEX FROM ${teacherAttendanceTable} WHERE Key_name = ?`, ['uq_teacher_schedule_attendance']);
+      if (!uniqueIndex.length) {
+        await queryAsync(`
+          ALTER TABLE ${teacherAttendanceTable}
+          ADD UNIQUE KEY uq_teacher_schedule_attendance (schedule_id, teacher_id, attendance_date)
+        `);
+      }
+    })().catch((error) => {
+      teacherAttendanceSchemaReady = null;
+      throw error;
+    });
+  }
+
+  return teacherAttendanceSchemaReady;
 }
 
 function getSessions(req, res) {
@@ -175,7 +368,7 @@ function createPeriod(req, res) {
 }
 
 function getSchedules(req, res) {
-  const { classroom_id, session_id, teacher_id, status, client_id } = req.query;
+  const { classroom_id, section_id, session_id, teacher_id, status, client_id, day_of_week } = req.query;
   const conditions = [];
   const values = [];
 
@@ -187,6 +380,11 @@ function getSchedules(req, res) {
   if (classroom_id) {
     conditions.push('cs.classroom_id = ?');
     values.push(classroom_id);
+  }
+
+  if (section_id) {
+    conditions.push('cs.section_id = ?');
+    values.push(section_id);
   }
 
   if (session_id) {
@@ -202,6 +400,12 @@ function getSchedules(req, res) {
   if (status) {
     conditions.push('cs.status = ?');
     values.push(status);
+  }
+
+  const normalizedDay = normalizeDayOfWeek(day_of_week);
+  if (normalizedDay) {
+    conditions.push('cs.day_of_week = ?');
+    values.push(normalizedDay);
   }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -384,6 +588,84 @@ function updateSchedule(req, res) {
     return res.status(200).json({
       success: true,
       message: 'Schedule updated successfully'
+    });
+  });
+}
+
+function getStudentAttendanceSettings(req, res) {
+  const clientId = normalizePositiveInteger(req.query.client_id || req.decoded?.client_id);
+
+  if (!clientId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client id is required'
+    });
+  }
+
+  ensureAttendanceSettingsTable((tableError) => {
+    if (tableError) {
+      return sendDatabaseError(res, tableError);
+    }
+
+    const sql = `
+      SELECT setting_value
+      FROM ${attendanceSettingsTable}
+      WHERE client_id = ? AND setting_key = ?
+      LIMIT 1
+    `;
+
+    pool.query(sql, [clientId, STUDENT_ATTENDANCE_MODE_KEY], (error, results) => {
+      if (error) {
+        return sendDatabaseError(res, error);
+      }
+
+      const mode = normalizeAttendanceMode(results[0]?.setting_value);
+      return res.status(200).json({
+        success: true,
+        data: {
+          student_attendance_mode: mode
+        }
+      });
+    });
+  });
+}
+
+function updateStudentAttendanceSettings(req, res) {
+  const clientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
+  const mode = normalizeAttendanceMode(req.body.studentAttendanceMode || req.body.student_attendance_mode);
+
+  if (!clientId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client id is required'
+    });
+  }
+
+  ensureAttendanceSettingsTable((tableError) => {
+    if (tableError) {
+      return sendDatabaseError(res, tableError);
+    }
+
+    const sql = `
+      INSERT INTO ${attendanceSettingsTable} (client_id, setting_key, setting_value)
+      VALUES (?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        setting_value = VALUES(setting_value),
+        updated_at = CURRENT_TIMESTAMP
+    `;
+
+    pool.query(sql, [clientId, STUDENT_ATTENDANCE_MODE_KEY, mode], (error) => {
+      if (error) {
+        return sendDatabaseError(res, error);
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: 'Student attendance settings saved successfully',
+        data: {
+          student_attendance_mode: mode
+        }
+      });
     });
   });
 }
@@ -580,7 +862,13 @@ function getStudentsForSchedule(req, res) {
   });
 }
 
-function getTeacherAttendance(req, res) {
+async function getTeacherAttendance(req, res) {
+  try {
+    await ensureTeacherAttendanceSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
   const { schedule_id, attendance_date, client_id } = req.query;
   const conditions = [];
   const values = [];
@@ -603,7 +891,7 @@ function getTeacherAttendance(req, res) {
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
   const sql = `
     SELECT
-      ta.teacher_attendance_id,
+      ta.attendance_id AS teacher_attendance_id,
       ta.schedule_id,
       ta.teacher_id,
       CONCAT(t.first_name, ' ', t.last_name) AS teacher_name,
@@ -633,8 +921,15 @@ function getTeacherAttendance(req, res) {
   });
 }
 
-function saveTeacherAttendance(req, res) {
+async function saveTeacherAttendance(req, res) {
+  try {
+    await ensureTeacherAttendanceSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
   const payload = buildAttendancePayload(req.body);
+  const requestedClientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
 
   if (!payload.schedule_id || !payload.teacher_id || !payload.attendance_date || !payload.status) {
     return res.status(400).json({
@@ -643,31 +938,59 @@ function saveTeacherAttendance(req, res) {
     });
   }
 
-  const sql = `
-    INSERT INTO ${teacherAttendanceTable} (schedule_id, teacher_id, attendance_date, status, check_in, notes, marked_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON DUPLICATE KEY UPDATE
-      status = VALUES(status),
-      check_in = VALUES(check_in),
-      notes = VALUES(notes),
-      marked_by = VALUES(marked_by),
-      updated_at = CURRENT_TIMESTAMP
+  const scheduleSql = `
+    SELECT client_id
+    FROM ${schedulesTable}
+    WHERE schedule_id = ?
+    LIMIT 1
   `;
 
-  pool.query(sql, [payload.schedule_id, payload.teacher_id, payload.attendance_date, payload.status, payload.check_in, payload.notes, payload.marked_by], (error) => {
-    if (error) {
-      return sendDatabaseError(res, error);
+  pool.query(scheduleSql, [payload.schedule_id], (scheduleError, schedules) => {
+    if (scheduleError) {
+      return sendDatabaseError(res, scheduleError);
     }
 
-    return res.status(200).json({
-      success: true,
-      message: 'Teacher attendance saved successfully'
+    const clientId = requestedClientId || normalizePositiveInteger(schedules[0]?.client_id);
+    if (!clientId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Client id is required'
+      });
+    }
+
+    const sql = `
+      INSERT INTO ${teacherAttendanceTable} (client_id, schedule_id, teacher_id, attendance_date, status, check_in, notes, marked_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        client_id = VALUES(client_id),
+        status = VALUES(status),
+        check_in = VALUES(check_in),
+        notes = VALUES(notes),
+        marked_by = VALUES(marked_by),
+        updated_at = CURRENT_TIMESTAMP
+    `;
+
+    pool.query(sql, [clientId, payload.schedule_id, payload.teacher_id, payload.attendance_date, payload.status, payload.check_in, payload.notes, payload.marked_by], (error) => {
+      if (error) {
+        return sendDatabaseError(res, error);
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: 'Teacher attendance saved successfully'
+      });
     });
   });
 }
 
-function getStudentAttendance(req, res) {
-  const { schedule_id, attendance_date, client_id } = req.query;
+async function getStudentAttendance(req, res) {
+  try {
+    await ensureStudentAttendanceSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
+  const { schedule_id, attendance_date, attendance_session, client_id, classroom_id, section_id, teacher_id } = req.query;
   const conditions = [];
   const values = [];
 
@@ -681,9 +1004,36 @@ function getStudentAttendance(req, res) {
     values.push(attendance_date);
   }
 
+  const normalizedSession = normalizeString(attendance_session);
+  if (normalizedSession) {
+    const session = normalizeAttendanceSession(normalizedSession);
+    if (session === 'Session') {
+      conditions.push('sa.attendance_session IN (?, ?, ?)');
+      values.push('Session', 'Morning', 'Afternoon');
+    } else {
+      conditions.push('sa.attendance_session = ?');
+      values.push(session);
+    }
+  }
+
   if (client_id) {
     conditions.push('cs.client_id = ?');
     values.push(client_id);
+  }
+
+  if (classroom_id) {
+    conditions.push('cs.classroom_id = ?');
+    values.push(classroom_id);
+  }
+
+  if (section_id) {
+    conditions.push('cs.section_id = ?');
+    values.push(section_id);
+  }
+
+  if (teacher_id) {
+    conditions.push('cs.teacher_id = ?');
+    values.push(teacher_id);
   }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -694,15 +1044,24 @@ function getStudentAttendance(req, res) {
       sa.student_id,
       CONCAT(s.first_name, ' ', s.last_name) AS student_name,
       sa.attendance_date,
+      sa.attendance_session,
       sa.status,
       sa.check_in,
       sa.notes,
       sa.marked_by,
+      sa.marked_by_teacher_id,
+      NULLIF(TRIM(CONCAT(COALESCE(markedTeacher.first_name, ''), ' ', COALESCE(markedTeacher.last_name, ''))), '') AS marked_by_teacher_name,
+      cs.classroom_id,
+      cs.section_id,
+      cs.teacher_id,
+      NULLIF(TRIM(CONCAT(COALESCE(scheduleTeacher.first_name, ''), ' ', COALESCE(scheduleTeacher.last_name, ''))), '') AS schedule_teacher_name,
       sa.created_at,
       sa.updated_at
     FROM ${studentAttendanceTable} sa
     LEFT JOIN ${studentsTable} s ON s.student_id = sa.student_id
     LEFT JOIN ${schedulesTable} cs ON cs.schedule_id = sa.schedule_id
+    LEFT JOIN ${teachersTable} markedTeacher ON markedTeacher.teacher_id = sa.marked_by_teacher_id
+    LEFT JOIN ${teachersTable} scheduleTeacher ON scheduleTeacher.teacher_id = cs.teacher_id
     ${whereClause}
     ORDER BY sa.attendance_date DESC, sa.created_at DESC
   `;
@@ -719,7 +1078,7 @@ function getStudentAttendance(req, res) {
   });
 }
 
-function saveStudentAttendance(req, res) {
+async function saveStudentAttendance(req, res) {
   const rows = Array.isArray(req.body) ? req.body : [req.body];
 
   if (!rows.length) {
@@ -729,24 +1088,53 @@ function saveStudentAttendance(req, res) {
     });
   }
 
-  const values = rows.map((row) => [
+  const normalizedRows = rows.map((row) => ({
+    scheduleId: normalizePositiveInteger(row.scheduleId || row.schedule_id),
+    studentId: normalizePositiveInteger(row.studentId || row.student_id),
+    attendanceDate: normalizeString(row.attendanceDate || row.attendance_date),
+    attendanceSession: normalizeAttendanceSession(row.attendanceSession || row.attendance_session),
+    status: normalizeString(row.status),
+    checkIn: normalizeString(row.checkIn || row.check_in),
+    notes: normalizeString(row.notes),
+    markedBy: row.markedBy || row.marked_by || null,
+    markedByTeacherId: normalizePositiveInteger(row.markedByTeacherId || row.marked_by_teacher_id)
+  }));
+
+  const hasInvalidRow = normalizedRows.some((row) => !row.scheduleId || !row.studentId || !row.attendanceDate || !row.status);
+  if (hasInvalidRow) {
+    return res.status(400).json({
+      success: false,
+      message: 'Schedule, student, date, and status are required for every attendance record'
+    });
+  }
+
+  try {
+    await ensureStudentAttendanceSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
+  const values = normalizedRows.map((row) => [
     row.scheduleId,
     row.studentId,
     row.attendanceDate,
+    row.attendanceSession,
     row.status,
-    row.checkIn || null,
-    row.notes || null,
-    row.markedBy || null
+    row.checkIn,
+    row.notes,
+    row.markedBy,
+    row.markedByTeacherId
   ]);
 
   const sql = `
-    INSERT INTO ${studentAttendanceTable} (schedule_id, student_id, attendance_date, status, check_in, notes, marked_by)
+    INSERT INTO ${studentAttendanceTable} (schedule_id, student_id, attendance_date, attendance_session, status, check_in, notes, marked_by, marked_by_teacher_id)
     VALUES ?
     ON DUPLICATE KEY UPDATE
       status = VALUES(status),
       check_in = VALUES(check_in),
       notes = VALUES(notes),
       marked_by = VALUES(marked_by),
+      marked_by_teacher_id = COALESCE(VALUES(marked_by_teacher_id), marked_by_teacher_id),
       updated_at = CURRENT_TIMESTAMP
   `;
 
@@ -773,6 +1161,8 @@ module.exports = {
   updateSchedule,
   assignTeacherToSchedule,
   deleteSchedule,
+  getStudentAttendanceSettings,
+  updateStudentAttendanceSettings,
   getStudentsForSchedule,
   getTeacherAttendance,
   saveTeacherAttendance,
