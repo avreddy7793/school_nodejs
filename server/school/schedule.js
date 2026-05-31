@@ -6,6 +6,8 @@ const periodsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('se
 const schedulesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('class_schedule')}`;
 const teachersTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teachers')}`;
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
+const sectionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('sections')}`;
+const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('subjects')}`;
 const teacherAttendanceTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teacher_attendance')}`;
 const studentAttendanceTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('student_attendance')}`;
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
@@ -50,14 +52,13 @@ function getValue(body, key, fallback = undefined) {
 
 function buildSchedulePayload(body) {
   return {
-    client_id: getValue(body, 'clientId'),
-    classroom_id: getValue(body, 'classroomId'),
-    session_id: getValue(body, 'sessionId'),
-    period_id: getValue(body, 'periodId'),
-    teacher_id: getValue(body, 'teacherId'),
-    subject: normalizeString(getValue(body, 'subject')),
-    grade: normalizeString(getValue(body, 'grade')),
-    section: normalizeString(getValue(body, 'section')),
+    client_id: getValue(body, 'clientId', getValue(body, 'client_id')),
+    classroom_id: getValue(body, 'classroomId', getValue(body, 'classroom_id')),
+    section_id: normalizePositiveInteger(getValue(body, 'sectionId', getValue(body, 'section_id'))),
+    subject_id: normalizePositiveInteger(getValue(body, 'subjectId', getValue(body, 'subject_id'))),
+    session_id: getValue(body, 'sessionId', getValue(body, 'session_id')),
+    period_id: getValue(body, 'periodId', getValue(body, 'period_id')),
+    teacher_id: getValue(body, 'teacherId', getValue(body, 'teacher_id')),
     day_of_week: getValue(body, 'dayOfWeek', null),
     schedule_date: getValue(body, 'scheduleDate', null),
     status: normalizeString(getValue(body, 'status')) || 'Active',
@@ -219,9 +220,11 @@ function getSchedules(req, res) {
       sp.duration_minutes,
       cs.teacher_id,
       CONCAT(t.first_name, ' ', t.last_name) AS teacher_name,
-      cs.subject,
-      cs.grade,
-      cs.section,
+      cs.subject_id,
+      subj.sub_name AS subject,
+      c.name AS grade,
+      cs.section_id,
+      sec.section_name AS section,
       cs.day_of_week,
       cs.schedule_date,
       cs.status,
@@ -233,6 +236,8 @@ function getSchedules(req, res) {
     LEFT JOIN ${sessionsTable} ss ON ss.session_id = cs.session_id
     LEFT JOIN ${periodsTable} sp ON sp.period_id = cs.period_id
     LEFT JOIN ${teachersTable} t ON t.teacher_id = cs.teacher_id
+    LEFT JOIN ${subjectsTable} subj ON subj.subject_id = cs.subject_id
+    LEFT JOIN ${sectionsTable} sec ON sec.section_id = cs.section_id
     ${whereClause}
     ORDER BY cs.session_id ASC, sp.period_number ASC, c.name ASC
   `;
@@ -266,9 +271,11 @@ function getScheduleById(req, res) {
       sp.duration_minutes,
       cs.teacher_id,
       CONCAT(t.first_name, ' ', t.last_name) AS teacher_name,
-      cs.subject,
-      cs.grade,
-      cs.section,
+      cs.subject_id,
+      subj.sub_name AS subject,
+      c.name AS grade,
+      cs.section_id,
+      sec.section_name AS section,
       cs.day_of_week,
       cs.schedule_date,
       cs.status,
@@ -280,6 +287,8 @@ function getScheduleById(req, res) {
     LEFT JOIN ${sessionsTable} ss ON ss.session_id = cs.session_id
     LEFT JOIN ${periodsTable} sp ON sp.period_id = cs.period_id
     LEFT JOIN ${teachersTable} t ON t.teacher_id = cs.teacher_id
+    LEFT JOIN ${subjectsTable} subj ON subj.subject_id = cs.subject_id
+    LEFT JOIN ${sectionsTable} sec ON sec.section_id = cs.section_id
     WHERE cs.schedule_id = ?
       AND (? IS NULL OR cs.client_id = ?)
   `;
@@ -434,9 +443,6 @@ function assignTeacherToSchedule(req, res) {
       const columns = ['teacher_id = ?'];
       const values = [teacherId];
       const optionalFields = {
-        subject: 'subject',
-        grade: 'grade',
-        section: 'section',
         status: 'status',
         notes: 'notes'
       };
@@ -445,6 +451,20 @@ function assignTeacherToSchedule(req, res) {
         if (req.body[bodyKey] !== undefined) {
           columns.push(`${column} = ?`);
           values.push(normalizeString(req.body[bodyKey]));
+        }
+      });
+
+      const optionalIdFields = {
+        subjectId: 'subject_id',
+        subject_id: 'subject_id',
+        sectionId: 'section_id',
+        section_id: 'section_id'
+      };
+
+      Object.entries(optionalIdFields).forEach(([bodyKey, column]) => {
+        if (req.body[bodyKey] !== undefined) {
+          columns.push(`${column} = ?`);
+          values.push(normalizePositiveInteger(req.body[bodyKey]));
         }
       });
 
@@ -496,10 +516,13 @@ function getStudentsForSchedule(req, res) {
   const clientId = req.query.client_id;
 
   const scheduleSql = `
-    SELECT grade, section
-    FROM ${schedulesTable}
-    WHERE schedule_id = ?
-      AND (? IS NULL OR client_id = ?)
+    SELECT
+      cs.classroom_id,
+      sec.section_name AS section
+    FROM ${schedulesTable} cs
+    LEFT JOIN ${sectionsTable} sec ON sec.section_id = cs.section_id
+    WHERE cs.schedule_id = ?
+      AND (? IS NULL OR cs.client_id = ?)
   `;
 
   pool.query(scheduleSql, [scheduleId, clientId || null, clientId || null], (scheduleError, scheduleResults) => {
@@ -514,13 +537,18 @@ function getStudentsForSchedule(req, res) {
       });
     }
 
-    const { grade, section } = scheduleResults[0];
+    const { classroom_id, section } = scheduleResults[0];
     const filters = [];
     const values = [];
 
-    if (grade) {
-      filters.push('(current_grade = ? OR grade_level = ?)');
-      values.push(grade, grade);
+    if (clientId) {
+      filters.push('client_id = ?');
+      values.push(clientId);
+    }
+
+    if (classroom_id) {
+      filters.push('class_name = ?');
+      values.push(classroom_id);
     }
 
     if (section) {

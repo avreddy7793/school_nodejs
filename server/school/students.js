@@ -737,12 +737,18 @@ async function getNextAdmissionNumber(req, res) {
 
 function getStudents(req, res) {
   const { client_id, grade, section, search } = req.query;
+  const classroomId = normalizePositiveInteger(req.query.classroom_id || req.query.className || req.query.class_name);
   const conditions = [];
   const values = [];
 
   if (client_id) {
     conditions.push('s.client_id = ?');
     values.push(client_id);
+  }
+
+  if (classroomId) {
+    conditions.push('s.class_name = ?');
+    values.push(classroomId);
   }
 
   if (grade) {

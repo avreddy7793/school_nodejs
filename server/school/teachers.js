@@ -5,6 +5,7 @@ const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const globalDatabase = process.env.DB_GLOBAL_DATABASE || process.env.DB_DATABASE || 'global';
 const teachersTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teachers')}`;
 const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('subjects')}`;
+const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
 const teacherSubjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teacher_subjects')}`;
 const teacherSubjectAssignmentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teacher_subject_assignments')}`;
 const classScheduleTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('class_schedule')}`;
@@ -746,11 +747,70 @@ function getTeachersBySubject(req, res) {
   });
 }
 
+function getSubjectsGroupedByClass(req, res) {
+  const clientId = normalizePositiveInteger(req.query.client_id || req.query.clientId);
+
+  if (!clientId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client id is required'
+    });
+  }
+
+  const sql = `
+    SELECT
+      c.classroom_id,
+      c.name AS class_name,
+      s.subject_id,
+      s.sub_name
+    FROM ${subjectsTable} s
+    LEFT JOIN ${classroomsTable} c
+      ON c.classroom_id = s.classroom_id
+    WHERE s.client_id = ?
+    ORDER BY c.name, s.sub_name
+  `;
+
+  pool.query(sql, [clientId], (error, results) => {
+    if (error) {
+      return sendDatabaseError(res, error);
+    }
+
+    const grouped = [];
+
+    results.forEach((row) => {
+      let classGroup = grouped.find(
+        item => item.classroom_id === row.classroom_id
+      );
+
+      if (!classGroup) {
+        classGroup = {
+          classroom_id: row.classroom_id,
+          class_name: row.class_name || 'General',
+          subjects: []
+        };
+
+        grouped.push(classGroup);
+      }
+
+      classGroup.subjects.push({
+        subject_id: row.subject_id,
+        sub_name: row.sub_name
+      });
+    });
+
+    return res.status(200).json({
+      success: true,
+      data: grouped
+    });
+  });
+}
+
 module.exports = {
   getTeachers,
   getTeacherById,
   getTeachersBySubject,
   createTeacher,
   updateTeacher,
-  deleteTeacher
+  deleteTeacher,
+  getSubjectsGroupedByClass
 };
