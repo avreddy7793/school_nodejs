@@ -2,6 +2,17 @@ const { pool } = require('../config');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const tableCache = new Map();
+const DEFAULT_SESSION_NAME = 'Regular Day';
+const DEFAULT_SESSION_PERIODS = [
+  { period_number: 1, label: 'Period 1', start_time: '09:00:00', end_time: '09:45:00', duration_minutes: 45 },
+  { period_number: 2, label: 'Period 2', start_time: '09:45:00', end_time: '10:30:00', duration_minutes: 45 },
+  { period_number: 3, label: 'Period 3', start_time: '10:45:00', end_time: '11:30:00', duration_minutes: 45 },
+  { period_number: 4, label: 'Period 4', start_time: '11:30:00', end_time: '12:15:00', duration_minutes: 45 },
+  { period_number: 5, label: 'Period 5', start_time: '13:00:00', end_time: '13:45:00', duration_minutes: 45 },
+  { period_number: 6, label: 'Period 6', start_time: '13:45:00', end_time: '14:30:00', duration_minutes: 45 },
+  { period_number: 7, label: 'Period 7', start_time: '14:45:00', end_time: '15:30:00', duration_minutes: 45 },
+  { period_number: 8, label: 'Period 8', start_time: '15:30:00', end_time: '16:15:00', duration_minutes: 45 }
+];
 
 function escapeIdentifier(value) {
   return `\`${String(value).replace(/`/g, '``')}\``;
@@ -291,6 +302,51 @@ async function getTableBasics() {
     periodsMeta,
     periodId: primaryColumn(periodsMeta, ['period_id', 'id'])
   };
+}
+
+function sessionNameColumn(sessionsMeta) {
+  return firstColumn(sessionsMeta, ['name', 'session_name', 'label']);
+}
+
+async function findSessionByName(name, nameColumn) {
+  const [rows] = await database().query(
+    `
+      SELECT *
+      FROM ${table('school_sessions')}
+      WHERE LOWER(${escapeIdentifier(nameColumn)}) = LOWER(?)
+      LIMIT 1
+    `,
+    [name]
+  );
+
+  return rows[0] || null;
+}
+
+async function ensureSession(name) {
+  const sessionsMeta = await getColumns('school_sessions');
+  const sessionId = primaryColumn(sessionsMeta, ['session_id', 'id']);
+  const nameColumn = sessionNameColumn(sessionsMeta);
+
+  if (!nameColumn) {
+    throw new Error('school_sessions table must have a name, session_name, or label column.');
+  }
+
+  const normalizedName = normalizeString(name) || DEFAULT_SESSION_NAME;
+  const existing = await findSessionByName(normalizedName, nameColumn);
+
+  if (existing) {
+    if (hasColumn(sessionsMeta, 'is_active') && Number(existing.is_active) !== 1) {
+      await updateRow('school_sessions', sessionId, existing[sessionId], { is_active: 1 });
+    }
+
+    return existing[sessionId];
+  }
+
+  return insertRow('school_sessions', pickPayload(sessionsMeta, {
+    [nameColumn]: normalizedName,
+    sort_order: 1,
+    is_active: 1
+  }));
 }
 
 async function validateSectionBelongs(sectionId, classroomId, basics) {
@@ -887,6 +943,212 @@ async function deleteSection(req, res) {
   return res.status(200).json({ success: true, message: 'Class section deleted successfully.' });
 }
 
+async function getSchoolSessions(req, res) {
+  const sessionsMeta = await getColumns('school_sessions');
+  const sessionId = primaryColumn(sessionsMeta, ['session_id', 'id']);
+  const nameColumn = sessionNameColumn(sessionsMeta);
+  const conditions = [];
+  const values = [];
+
+  if (!nameColumn) {
+    return res.status(500).json({
+      success: false,
+      message: 'school_sessions table must have a name, session_name, or label column.'
+    });
+  }
+
+  if (req.query.include_inactive !== 'true' && hasColumn(sessionsMeta, 'is_active')) {
+    conditions.push('is_active = 1');
+  }
+
+  const clientId = clientIdFrom(req);
+  if (clientId && hasColumn(sessionsMeta, 'client_id')) {
+    conditions.push('client_id = ?');
+    values.push(clientId);
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const [rows] = await database().query(
+    `
+      SELECT
+        ${escapeIdentifier(sessionId)} AS session_id,
+        ${escapeIdentifier(nameColumn)} AS name,
+        ${hasColumn(sessionsMeta, 'sort_order') ? 'sort_order' : '1 AS sort_order'},
+        ${hasColumn(sessionsMeta, 'is_active') ? 'is_active' : '1 AS is_active'}
+      FROM ${table('school_sessions')}
+      ${where}
+      ORDER BY ${hasColumn(sessionsMeta, 'sort_order') ? 'sort_order ASC,' : ''} ${escapeIdentifier(nameColumn)} ASC
+    `,
+    values
+  );
+
+  return res.status(200).json({ success: true, data: rows });
+}
+
+async function createSchoolSession(req, res) {
+  const sessionsMeta = await getColumns('school_sessions');
+  const sessionId = primaryColumn(sessionsMeta, ['session_id', 'id']);
+  const nameColumn = sessionNameColumn(sessionsMeta);
+  const name = normalizeString(getValue(req.body || {}, 'name', 'name'));
+
+  if (!nameColumn) {
+    return res.status(500).json({
+      success: false,
+      message: 'school_sessions table must have a name, session_name, or label column.'
+    });
+  }
+
+  if (!name) {
+    return res.status(400).json({ success: false, message: 'Session name is required.' });
+  }
+
+  const existing = await findSessionByName(name, nameColumn);
+  if (existing) {
+    return res.status(200).json({
+      success: true,
+      message: 'Session already exists.',
+      id: existing[sessionId],
+      session_id: existing[sessionId]
+    });
+  }
+
+  const id = await insertRow('school_sessions', pickPayload(sessionsMeta, {
+    [nameColumn]: name,
+    sort_order: normalizePositiveInteger(getValue(req.body || {}, 'sortOrder', 'sort_order')) || 1,
+    is_active: getValue(req.body || {}, 'isActive', 'is_active', 1)
+  }));
+
+  return res.status(201).json({
+    success: true,
+    message: 'Session created successfully.',
+    id,
+    session_id: id
+  });
+}
+
+function buildPeriodPayload(req, periodsMeta) {
+  const body = req.body || {};
+  return pickPayload(periodsMeta, {
+    session_id: normalizePositiveInteger(getValue(body, 'sessionId', 'session_id')),
+    period_number: normalizePositiveInteger(getValue(body, 'periodNumber', 'period_number')),
+    label: normalizeString(getValue(body, 'label', 'label')),
+    start_time: normalizeString(getValue(body, 'startTime', 'start_time')),
+    end_time: normalizeString(getValue(body, 'endTime', 'end_time')),
+    duration_minutes: normalizePositiveInteger(getValue(body, 'durationMinutes', 'duration_minutes')),
+    is_active: getValue(body, 'isActive', 'is_active', 1)
+  });
+}
+
+function validatePeriodPayload(payload, periodsMeta) {
+  if (hasColumn(periodsMeta, 'session_id') && !payload.session_id) {
+    return 'Session is required.';
+  }
+
+  if (hasColumn(periodsMeta, 'period_number') && !payload.period_number) {
+    return 'Period number is required.';
+  }
+
+  if (hasColumn(periodsMeta, 'label') && !payload.label) {
+    return 'Period label is required.';
+  }
+
+  if (hasColumn(periodsMeta, 'start_time') && !payload.start_time) {
+    return 'Start time is required.';
+  }
+
+  if (hasColumn(periodsMeta, 'end_time') && !payload.end_time) {
+    return 'End time is required.';
+  }
+
+  if (hasColumn(periodsMeta, 'duration_minutes') && !payload.duration_minutes) {
+    return 'Duration is required.';
+  }
+
+  return null;
+}
+
+async function createSessionPeriod(req, res) {
+  const periodsMeta = await getColumns('session_periods');
+  const payload = buildPeriodPayload(req, periodsMeta);
+  const validationError = validatePeriodPayload(payload, periodsMeta);
+
+  if (validationError) {
+    return res.status(400).json({ success: false, message: validationError });
+  }
+
+  if (hasColumn(periodsMeta, 'session_id')) {
+    const sessionsMeta = await getColumns('school_sessions');
+    const sessionId = primaryColumn(sessionsMeta, ['session_id', 'id']);
+    const sessionExists = await existsById('school_sessions', sessionId, payload.session_id);
+
+    if (!sessionExists) {
+      return res.status(400).json({ success: false, message: 'Session must exist.' });
+    }
+  }
+
+  const id = await insertRow('session_periods', payload);
+  return res.status(201).json({
+    success: true,
+    message: 'Period created successfully.',
+    id,
+    period_id: id
+  });
+}
+
+async function seedDefaultSessionPeriods(req, res) {
+  const periodsMeta = await getColumns('session_periods');
+  const periodId = primaryColumn(periodsMeta, ['period_id', 'id']);
+  const sessionId = await ensureSession(getValue(req.body || {}, 'sessionName', 'session_name', DEFAULT_SESSION_NAME));
+  const createdIds = [];
+  let existingCount = 0;
+
+  for (const period of DEFAULT_SESSION_PERIODS) {
+    const [existingPeriods] = await database().query(
+      `
+        SELECT ${escapeIdentifier(periodId)} AS period_id
+        FROM ${table('session_periods')}
+        WHERE session_id = ? AND period_number = ?
+        LIMIT 1
+      `,
+      [sessionId, period.period_number]
+    );
+
+    if (existingPeriods.length) {
+      existingCount += 1;
+
+      if (hasColumn(periodsMeta, 'is_active')) {
+        await updateRow('session_periods', periodId, existingPeriods[0].period_id, { is_active: 1 });
+      }
+
+      continue;
+    }
+
+    const payload = pickPayload(periodsMeta, {
+      session_id: sessionId,
+      ...period,
+      is_active: 1
+    });
+    const validationError = validatePeriodPayload(payload, periodsMeta);
+
+    if (validationError) {
+      return res.status(400).json({ success: false, message: validationError });
+    }
+
+    createdIds.push(await insertRow('session_periods', payload));
+  }
+
+  return res.status(createdIds.length ? 201 : 200).json({
+    success: true,
+    message: createdIds.length
+      ? 'Default timetable periods created successfully.'
+      : 'Default timetable periods are already available.',
+    session_id: sessionId,
+    created_count: createdIds.length,
+    existing_count: existingCount,
+    period_ids: createdIds
+  });
+}
+
 async function getSessionPeriods(req, res) {
   const periodsMeta = await getColumns('session_periods');
   const conditions = [];
@@ -1183,7 +1445,11 @@ module.exports = {
   createSection: asyncHandler(createSection),
   updateSection: asyncHandler(updateSection),
   deleteSection: asyncHandler(deleteSection),
+  getSchoolSessions: asyncHandler(getSchoolSessions),
+  createSchoolSession: asyncHandler(createSchoolSession),
   getSessionPeriods: asyncHandler(getSessionPeriods),
+  createSessionPeriod: asyncHandler(createSessionPeriod),
+  seedDefaultSessionPeriods: asyncHandler(seedDefaultSessionPeriods),
   getTeacherSubjectAssignments: asyncHandler(getTeacherSubjectAssignments),
   createTeacherSubjectAssignment: asyncHandler(createTeacherSubjectAssignment),
   updateTeacherSubjectAssignment: asyncHandler(updateTeacherSubjectAssignment),

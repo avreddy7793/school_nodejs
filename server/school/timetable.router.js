@@ -7,7 +7,11 @@ router.get('/sections', timetable.getSections);
 router.post('/sections', timetable.createSection);
 router.put('/sections/:id', timetable.updateSection);
 router.delete('/sections/:id', timetable.deleteSection);
+router.get('/school-sessions', timetable.getSchoolSessions);
+router.post('/school-sessions', timetable.createSchoolSession);
 router.get('/session-periods', timetable.getSessionPeriods);
+router.post('/session-periods', timetable.createSessionPeriod);
+router.post('/session-periods/defaults', timetable.seedDefaultSessionPeriods);
 
 router.get('/teacher-subject-assignments', timetable.getTeacherSubjectAssignments);
 router.post('/teacher-subject-assignments', timetable.createTeacherSubjectAssignment);
