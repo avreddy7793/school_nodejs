@@ -1,5 +1,4 @@
-const globalDatabase = process.env.DB_GLOBAL_DATABASE || process.env.DB_DATABASE || 'global';
-const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
+const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 
 const loginTable = table('login');
 const clientCategoryTable = table('client_category');
@@ -9,7 +8,7 @@ const rolesTable = table('roles');
 const userEntityLinksTable = schoolTable('user_entity_links');
 
 function table(name) {
-    return `${escapeIdentifier(globalDatabase)}.${escapeIdentifier(name)}`;
+    return `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier(name)}`;
 }
 
 function schoolTable(name) {

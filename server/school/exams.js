@@ -23,7 +23,7 @@ const selectableColumns = `
     LEFT JOIN ${teachersTable} t ON t.teacher_id = cs.teacher_id
     WHERE cs.classroom_id = s.classroom_id
       AND cs.client_id = e.client_id
-      AND LOWER(TRIM(cs.subject)) COLLATE utf8mb4_0900_ai_ci = LOWER(TRIM(s.sub_name)) COLLATE utf8mb4_0900_ai_ci
+      AND cs.subject_id = s.subject_id
       AND (cs.status IS NULL OR cs.status = 'Active')
   ) AS teacher_name,
   e.exam_date,

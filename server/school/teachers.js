@@ -1,8 +1,7 @@
 const { pool } = require('../config');
 const crypto = require('crypto');
 
-const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
-const globalDatabase = process.env.DB_GLOBAL_DATABASE || process.env.DB_DATABASE || 'global';
+const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const teachersTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teachers')}`;
 const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('subjects')}`;
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
@@ -11,9 +10,9 @@ const teacherSubjectAssignmentsTable = `${escapeIdentifier(schoolDatabase)}.${es
 const classScheduleTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('class_schedule')}`;
 const classroomSessionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classroom_sessions')}`;
 const userEntityLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('user_entity_links')}`;
-const loginTable = `${escapeIdentifier(globalDatabase)}.${escapeIdentifier('login')}`;
-const rolesTable = `${escapeIdentifier(globalDatabase)}.${escapeIdentifier('roles')}`;
-const clientMasterTable = `${escapeIdentifier(globalDatabase)}.${escapeIdentifier('client_master')}`;
+const loginTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('login')}`;
+const rolesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('roles')}`;
+const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
 
 const selectableColumns = `
   teacher_id,
