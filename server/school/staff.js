@@ -1,7 +1,12 @@
+const crypto = require('crypto');
 const { pool } = require('../config');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const staffTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('staff')}`;
+const loginTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('login')}`;
+const rolesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('roles')}`;
+const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
+const userEntityLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('user_entity_links')}`;
 
 const selectableColumns = `
   staff_id,
@@ -59,6 +64,18 @@ function normalizeText(value) {
   return trimmed || null;
 }
 
+function normalizeBoolean(value, fallback = true) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  return !['false', '0', 'no'].includes(String(value).trim().toLowerCase());
+}
+
 function normalizePositiveInteger(value) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
@@ -86,6 +103,15 @@ function buildStaffPayload(body) {
     address: normalizeText(getValue(body, 'address')),
     joiningDate: normalizeText(getValue(body, 'joiningDate', 'joining_date', today())),
     status: normalizeStatus(getValue(body, 'status'))
+  };
+}
+
+function buildStaffLoginOptions(body, payload) {
+  return {
+    createLogin: normalizeBoolean(getValue(body, 'createLogin', 'create_login'), true),
+    loginEmail: normalizeText(getValue(body, 'loginEmail', 'login_email')) || normalizeText(payload.email),
+    loginPassword: normalizeText(getValue(body, 'loginPassword', 'login_password')),
+    branchId: normalizePositiveInteger(getValue(body, 'branchId', 'branch_id'))
   };
 }
 
@@ -132,20 +158,138 @@ function buildStaffUpdatePayload(body) {
   return payload;
 }
 
-function getNextEmployeeId(callback) {
-  pool.query(`SELECT employee_id FROM ${staffTable}`, (error, results) => {
-    if (error) {
-      callback(error);
-      return;
-    }
+async function getNextEmployeeIdAsync(connection) {
+  const [results] = await connection.query(`SELECT employee_id FROM ${staffTable}`);
+  const maxNumber = results.reduce((max, row) => {
+    const match = String(row.employee_id || '').match(/(\d+)$/);
+    return match ? Math.max(max, Number(match[1])) : max;
+  }, 0);
 
-    const maxNumber = results.reduce((max, row) => {
-      const match = String(row.employee_id || '').match(/(\d+)$/);
-      return match ? Math.max(max, Number(match[1])) : max;
-    }, 0);
+  return `STF${String(maxNumber + 1).padStart(3, '0')}`;
+}
 
-    callback(null, `STF${String(maxNumber + 1).padStart(4, '0')}`);
+function hashPassword(password) {
+  const salt = crypto.randomBytes(Math.ceil(15 / 2)).toString('hex').slice(0, 15);
+  const hash = crypto.createHmac('sha512', salt);
+  hash.update(password);
+
+  return {
+    salt,
+    passkey: hash.digest('hex')
+  };
+}
+
+function buildStaffName(payload) {
+  return [payload.firstName, payload.lastName].filter(Boolean).join(' ');
+}
+
+function buildTemporaryPassword(staffId, contactNumber) {
+  const phoneSuffix = String(contactNumber || '').replace(/\D/g, '').slice(-4);
+  const suffix = phoneSuffix || String(Math.floor(Math.random() * 9000) + 1000);
+  return `Staff@${staffId}${suffix}`;
+}
+
+async function ensureUserEntityLinksTable(connection) {
+  await connection.query(`
+    CREATE TABLE IF NOT EXISTS ${userEntityLinksTable} (
+      link_id int NOT NULL AUTO_INCREMENT,
+      client_id bigint NOT NULL,
+      login_id int NOT NULL,
+      entity_type enum('TEACHER','STUDENT','PARENT','STAFF') NOT NULL,
+      entity_id int NOT NULL,
+      relationship varchar(50) DEFAULT NULL,
+      status enum('ACTIVE','INACTIVE') DEFAULT 'ACTIVE',
+      PRIMARY KEY (link_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+}
+
+async function getClientCategoryId(connection, clientId) {
+  const [rows] = await connection.query(`SELECT category FROM ${clientMasterTable} WHERE client_id = ?`, [clientId]);
+  return rows[0]?.category || null;
+}
+
+async function getOrCreateStaffRole(connection, clientId) {
+  const [roles] = await connection.query(`
+    SELECT id
+    FROM ${rolesTable}
+    WHERE UPPER(role_name) = 'STAFF'
+      AND (client_id = ? OR client_id IS NULL)
+    ORDER BY CASE WHEN client_id = ? THEN 0 ELSE 1 END
+    LIMIT 1
+  `, [clientId, clientId]);
+
+  if (roles.length) {
+    return roles[0].id;
+  }
+
+  const [result] = await connection.query(
+    `INSERT INTO ${rolesTable} (client_id, role_name, navbar) VALUES (?, 'STAFF', ?)`,
+    [clientId, JSON.stringify({ navbar: [] })]
+  );
+
+  return result.insertId;
+}
+
+async function createStaffLogin(connection, payload, staffId, loginOptions) {
+  if (!loginOptions.createLogin) {
+    return null;
+  }
+
+  if (!loginOptions.loginEmail) {
+    const error = new Error('Staff login email is required');
+    error.code = 'LOGIN_EMAIL_REQUIRED';
+    throw error;
+  }
+
+  const [existingLogins] = await connection.query(`SELECT login_id FROM ${loginTable} WHERE login_email = ? LIMIT 1`, [loginOptions.loginEmail]);
+  if (existingLogins.length) {
+    const error = new Error('A login already exists with this email');
+    error.code = 'LOGIN_EXISTS';
+    throw error;
+  }
+
+  await ensureUserEntityLinksTable(connection);
+
+  const password = loginOptions.loginPassword || buildTemporaryPassword(staffId, payload.contactNumber);
+  const passwordHash = hashPassword(password);
+  const roleId = await getOrCreateStaffRole(connection, payload.client_id);
+  const categoryId = await getClientCategoryId(connection, payload.client_id);
+
+  const loginPayload = {
+    login_email: loginOptions.loginEmail,
+    passkey: passwordHash.passkey,
+    salt: passwordHash.salt,
+    login_name: buildStaffName(payload),
+    login_designation: payload.role || 'Staff',
+    login_type: 'STAFF',
+    client_id: payload.client_id,
+    created_by: null,
+    emp_id: null,
+    status: 'ACTIVATED',
+    category: categoryId,
+    role: roleId,
+    password: null,
+    branch_id: loginOptions.branchId || null
+  };
+
+  const [loginResult] = await connection.query(`INSERT INTO ${loginTable} SET ?`, loginPayload);
+
+  await connection.query(`INSERT INTO ${userEntityLinksTable} SET ?`, {
+    client_id: payload.client_id,
+    login_id: loginResult.insertId,
+    entity_type: 'STAFF',
+    entity_id: staffId,
+    relationship: payload.role || 'STAFF',
+    status: 'ACTIVE'
   });
+
+  return {
+    login_id: loginResult.insertId,
+    login_email: loginOptions.loginEmail,
+    temporary_password: password,
+    role: 'STAFF'
+  };
 }
 
 function getStaff(req, res) {
@@ -212,8 +356,9 @@ function getStaffById(req, res) {
   });
 }
 
-function createStaff(req, res) {
+async function createStaff(req, res) {
   const payload = buildStaffPayload(req.body);
+  const loginOptions = buildStaffLoginOptions(req.body, payload);
 
   if (!payload.client_id || !payload.firstName || !payload.lastName || !payload.role || !payload.contactNumber || !payload.joiningDate) {
     return res.status(400).json({
@@ -222,41 +367,54 @@ function createStaff(req, res) {
     });
   }
 
-  const insertStaff = () => {
-    pool.query(`INSERT INTO ${staffTable} SET ?`, payload, (error, result) => {
-      if (error) {
-        if (error.code === 'ER_DUP_ENTRY') {
-          return res.status(409).json({
-            success: false,
-            message: 'Employee ID or email already exists'
-          });
-        }
+  const connection = await pool.promise().getConnection();
 
-        return sendDatabaseError(res, error);
-      }
+  try {
+    await connection.beginTransaction();
 
-      return res.status(201).json({
-        success: true,
-        message: 'Staff member saved successfully',
-        staff_id: result.insertId,
-        employee_id: payload.employee_id
-      });
-    });
-  };
-
-  if (payload.employee_id) {
-    insertStaff();
-    return;
-  }
-
-  getNextEmployeeId((error, employeeId) => {
-    if (error) {
-      return sendDatabaseError(res, error);
+    if (!payload.employee_id) {
+      payload.employee_id = await getNextEmployeeIdAsync(connection);
     }
 
-    payload.employee_id = employeeId;
-    insertStaff();
-  });
+    const [result] = await connection.query(`INSERT INTO ${staffTable} SET ?`, payload);
+    const login = await createStaffLogin(connection, payload, result.insertId, loginOptions);
+
+    await connection.commit();
+    return res.status(201).json({
+      success: true,
+      message: login ? 'Staff member saved successfully with portal login' : 'Staff member saved successfully',
+      staff_id: result.insertId,
+      employee_id: payload.employee_id,
+      login
+    });
+  } catch (error) {
+    await connection.rollback();
+
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({
+        success: false,
+        message: 'Employee ID or email already exists'
+      });
+    }
+
+    if (error.code === 'LOGIN_EXISTS') {
+      return res.status(409).json({
+        success: false,
+        message: 'A login already exists with this email. Use another portal login email.'
+      });
+    }
+
+    if (error.code === 'LOGIN_EMAIL_REQUIRED') {
+      return res.status(400).json({
+        success: false,
+        message: 'Staff login email is required'
+      });
+    }
+
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
 }
 
 function updateStaff(req, res) {
