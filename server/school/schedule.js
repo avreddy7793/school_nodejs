@@ -10,11 +10,13 @@ const sectionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('s
 const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('subjects')}`;
 const teacherAttendanceTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teacher_attendance')}`;
 const studentAttendanceTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('student_attendance')}`;
+const legacyAttendanceTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('attendance')}`;
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
 const attendanceSettingsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('attendance_settings')}`;
 const STUDENT_ATTENDANCE_MODE_KEY = 'student_attendance_mode';
 const STUDENT_ATTENDANCE_MODES = new Set(['SESSION_WISE', 'PERIOD_WISE']);
 const STUDENT_ATTENDANCE_SESSIONS = new Set(['Session', 'Period', 'Morning', 'Afternoon']);
+const TEACHER_ATTENDANCE_SESSIONS = new Set(['Morning', 'Afternoon']);
 let studentAttendanceSchemaReady = null;
 let teacherAttendanceSchemaReady = null;
 
@@ -108,6 +110,47 @@ function normalizeAttendanceSession(value) {
   return mapped && STUDENT_ATTENDANCE_SESSIONS.has(mapped) ? mapped : 'Period';
 }
 
+function normalizeTeacherAttendanceSession(value) {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return 'Morning';
+  }
+
+  const key = normalized.toUpperCase().replace(/[\s-]+/g, '_');
+  const sessionMap = {
+    MORNING: 'Morning',
+    MORNING_SESSION: 'Morning',
+    AFTERNOON: 'Afternoon',
+    AFTERNOON_SESSION: 'Afternoon'
+  };
+
+  const mapped = sessionMap[key];
+  return mapped && TEACHER_ATTENDANCE_SESSIONS.has(mapped) ? mapped : 'Morning';
+}
+
+function normalizeLegacyStudentStatus(value) {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return 'Leave';
+  }
+
+  const key = normalized.toUpperCase().replace(/[\s-]+/g, '_');
+  const statusMap = {
+    PRESENT: 'Present',
+    ABSENT: 'Absent',
+    LATE: 'Late',
+    LEAVE: 'Leave',
+    ON_LEAVE: 'Leave',
+    EXCUSED: 'Leave'
+  };
+
+  return statusMap[key] || 'Leave';
+}
+
+function isLegacySessionAttendance(row) {
+  return row.attendanceSession === 'Morning' || row.attendanceSession === 'Afternoon';
+}
+
 function getValue(body, key, fallback = undefined) {
   if (body[key] !== undefined) {
     return body[key];
@@ -134,9 +177,10 @@ function buildSchedulePayload(body) {
 
 function buildAttendancePayload(body) {
   return {
-    schedule_id: getValue(body, 'scheduleId'),
-    teacher_id: getValue(body, 'teacherId'),
+    schedule_id: normalizePositiveInteger(getValue(body, 'scheduleId', getValue(body, 'schedule_id'))),
+    teacher_id: normalizePositiveInteger(getValue(body, 'teacherId', getValue(body, 'teacher_id'))),
     attendance_date: normalizeString(getValue(body, 'attendanceDate')),
+    attendance_session: normalizeTeacherAttendanceSession(getValue(body, 'attendanceSession', getValue(body, 'attendance_session'))),
     status: normalizeString(getValue(body, 'status')),
     check_in: normalizeString(getValue(body, 'checkIn')),
     notes: normalizeString(getValue(body, 'notes')),
@@ -230,6 +274,13 @@ function ensureTeacherAttendanceSchema() {
         await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN schedule_id INT DEFAULT NULL AFTER client_id`);
       }
 
+      if (!columnNames.has('attendance_session')) {
+        await queryAsync(`
+          ALTER TABLE ${teacherAttendanceTable}
+          ADD COLUMN attendance_session VARCHAR(20) NOT NULL DEFAULT 'Morning' AFTER attendance_date
+        `);
+      }
+
       if (!columnNames.has('check_in')) {
         await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN check_in TIME DEFAULT NULL AFTER status`);
 
@@ -255,12 +306,9 @@ function ensureTeacherAttendanceSchema() {
         MODIFY status ENUM('Present','Late','Absent','On Leave') NOT NULL
       `);
 
-      const uniqueIndex = await queryAsync(`SHOW INDEX FROM ${teacherAttendanceTable} WHERE Key_name = ?`, ['uq_teacher_schedule_attendance']);
-      if (!uniqueIndex.length) {
-        await queryAsync(`
-          ALTER TABLE ${teacherAttendanceTable}
-          ADD UNIQUE KEY uq_teacher_schedule_attendance (schedule_id, teacher_id, attendance_date)
-        `);
+      const oldUniqueIndex = await queryAsync(`SHOW INDEX FROM ${teacherAttendanceTable} WHERE Key_name = ?`, ['uq_teacher_schedule_attendance']);
+      if (oldUniqueIndex.length) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} DROP INDEX uq_teacher_schedule_attendance`);
       }
     })().catch((error) => {
       teacherAttendanceSchemaReady = null;
@@ -269,6 +317,72 @@ function ensureTeacherAttendanceSchema() {
   }
 
   return teacherAttendanceSchemaReady;
+}
+
+async function saveLegacySessionAttendance(rows) {
+  const sessionRows = rows.filter(isLegacySessionAttendance);
+  if (!sessionRows.length) {
+    return;
+  }
+
+  const scheduleIds = [...new Set(sessionRows.map((row) => row.scheduleId).filter(Boolean))];
+  const scheduleMap = new Map();
+
+  if (scheduleIds.length) {
+    const schedules = await queryAsync(`
+      SELECT schedule_id, client_id, teacher_id
+      FROM ${schedulesTable}
+      WHERE schedule_id IN (?)
+    `, [scheduleIds]);
+
+    schedules.forEach((schedule) => {
+      scheduleMap.set(Number(schedule.schedule_id), schedule);
+    });
+  }
+
+  const valueForRow = (row) => {
+    const schedule = scheduleMap.get(Number(row.scheduleId)) || {};
+    return [
+      schedule.client_id || null,
+      row.studentId,
+      row.markedByTeacherId || schedule.teacher_id || null,
+      row.attendanceDate,
+      normalizeLegacyStudentStatus(row.status),
+      row.notes,
+      row.checkIn
+    ];
+  };
+
+  const morningRows = sessionRows.filter((row) => row.attendanceSession === 'Morning').map(valueForRow);
+  const afternoonRows = sessionRows.filter((row) => row.attendanceSession === 'Afternoon').map(valueForRow);
+
+  if (morningRows.length) {
+    await queryAsync(`
+      INSERT INTO ${legacyAttendanceTable}
+        (client_id, student_id, teacher_id, attendance_date, morning_status, remarks, check_in_time_morning)
+      VALUES ?
+      ON DUPLICATE KEY UPDATE
+        client_id = COALESCE(VALUES(client_id), client_id),
+        teacher_id = COALESCE(VALUES(teacher_id), teacher_id),
+        morning_status = VALUES(morning_status),
+        remarks = COALESCE(VALUES(remarks), remarks),
+        check_in_time_morning = COALESCE(VALUES(check_in_time_morning), check_in_time_morning)
+    `, [morningRows]);
+  }
+
+  if (afternoonRows.length) {
+    await queryAsync(`
+      INSERT INTO ${legacyAttendanceTable}
+        (client_id, student_id, teacher_id, attendance_date, afternoon_status, remarks, check_in_time_afternoon)
+      VALUES ?
+      ON DUPLICATE KEY UPDATE
+        client_id = COALESCE(VALUES(client_id), client_id),
+        teacher_id = COALESCE(VALUES(teacher_id), teacher_id),
+        afternoon_status = VALUES(afternoon_status),
+        remarks = COALESCE(VALUES(remarks), remarks),
+        check_in_time_afternoon = COALESCE(VALUES(check_in_time_afternoon), check_in_time_afternoon)
+    `, [afternoonRows]);
+  }
 }
 
 function getSessions(req, res) {
@@ -869,7 +983,7 @@ async function getTeacherAttendance(req, res) {
     return sendDatabaseError(res, error);
   }
 
-  const { schedule_id, attendance_date, client_id } = req.query;
+  const { schedule_id, attendance_date, attendance_session, client_id, teacher_id } = req.query;
   const conditions = [];
   const values = [];
 
@@ -883,9 +997,19 @@ async function getTeacherAttendance(req, res) {
     values.push(attendance_date);
   }
 
+  if (attendance_session) {
+    conditions.push('ta.attendance_session = ?');
+    values.push(normalizeTeacherAttendanceSession(attendance_session));
+  }
+
+  if (teacher_id) {
+    conditions.push('ta.teacher_id = ?');
+    values.push(teacher_id);
+  }
+
   if (client_id) {
-    conditions.push('cs.client_id = ?');
-    values.push(client_id);
+    conditions.push('(ta.client_id = ? OR cs.client_id = ?)');
+    values.push(client_id, client_id);
   }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -896,6 +1020,7 @@ async function getTeacherAttendance(req, res) {
       ta.teacher_id,
       CONCAT(t.first_name, ' ', t.last_name) AS teacher_name,
       ta.attendance_date,
+      ta.attendance_session,
       ta.status,
       ta.check_in,
       ta.notes,
@@ -906,7 +1031,7 @@ async function getTeacherAttendance(req, res) {
     LEFT JOIN ${teachersTable} t ON t.teacher_id = ta.teacher_id
     LEFT JOIN ${schedulesTable} cs ON cs.schedule_id = ta.schedule_id
     ${whereClause}
-    ORDER BY ta.attendance_date DESC, ta.created_at DESC
+    ORDER BY ta.attendance_date DESC, FIELD(ta.attendance_session, 'Morning', 'Afternoon') ASC, ta.created_at DESC
   `;
 
   pool.query(sql, values, (error, results) => {
@@ -931,26 +1056,22 @@ async function saveTeacherAttendance(req, res) {
   const payload = buildAttendancePayload(req.body);
   const requestedClientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
 
-  if (!payload.schedule_id || !payload.teacher_id || !payload.attendance_date || !payload.status) {
+  if (!payload.teacher_id || !payload.attendance_date || !payload.status) {
     return res.status(400).json({
       success: false,
-      message: 'Schedule, teacher, date, and status are required'
+      message: 'Teacher, date, session, and status are required'
     });
   }
 
-  const scheduleSql = `
+  const scheduleSql = payload.schedule_id ? `
     SELECT client_id
     FROM ${schedulesTable}
     WHERE schedule_id = ?
     LIMIT 1
-  `;
+  ` : null;
 
-  pool.query(scheduleSql, [payload.schedule_id], (scheduleError, schedules) => {
-    if (scheduleError) {
-      return sendDatabaseError(res, scheduleError);
-    }
-
-    const clientId = requestedClientId || normalizePositiveInteger(schedules[0]?.client_id);
+  const saveRecord = (scheduleClientId = null) => {
+    const clientId = requestedClientId || normalizePositiveInteger(scheduleClientId);
     if (!clientId) {
       return res.status(400).json({
         success: false,
@@ -958,28 +1079,82 @@ async function saveTeacherAttendance(req, res) {
       });
     }
 
-    const sql = `
-      INSERT INTO ${teacherAttendanceTable} (client_id, schedule_id, teacher_id, attendance_date, status, check_in, notes, marked_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        client_id = VALUES(client_id),
-        status = VALUES(status),
-        check_in = VALUES(check_in),
-        notes = VALUES(notes),
-        marked_by = VALUES(marked_by),
-        updated_at = CURRENT_TIMESTAMP
+    const findExistingSql = `
+      SELECT attendance_id
+      FROM ${teacherAttendanceTable}
+      WHERE client_id = ?
+        AND teacher_id = ?
+        AND attendance_date = ?
+        AND attendance_session = ?
+      LIMIT 1
     `;
+    const findValues = [clientId, payload.teacher_id, payload.attendance_date, payload.attendance_session];
 
-    pool.query(sql, [clientId, payload.schedule_id, payload.teacher_id, payload.attendance_date, payload.status, payload.check_in, payload.notes, payload.marked_by], (error) => {
-      if (error) {
-        return sendDatabaseError(res, error);
+    pool.query(findExistingSql, findValues, (findError, existingRows) => {
+      if (findError) {
+        return sendDatabaseError(res, findError);
       }
 
-      return res.status(200).json({
-        success: true,
-        message: 'Teacher attendance saved successfully'
-      });
+      if (existingRows.length) {
+        const updateSql = `
+          UPDATE ${teacherAttendanceTable}
+          SET schedule_id = ?,
+              status = ?,
+              check_in = COALESCE(?, check_in, CURTIME()),
+              notes = ?,
+              marked_by = ?,
+              updated_at = CURRENT_TIMESTAMP
+          WHERE attendance_id = ?
+        `;
+
+        return pool.query(
+          updateSql,
+          [payload.schedule_id || null, payload.status, payload.check_in, payload.notes, payload.marked_by, existingRows[0].attendance_id],
+          (updateError) => {
+            if (updateError) {
+              return sendDatabaseError(res, updateError);
+            }
+
+            return res.status(200).json({
+              success: true,
+              message: 'Teacher attendance saved successfully'
+            });
+          }
+        );
+      }
+
+      const insertSql = `
+        INSERT INTO ${teacherAttendanceTable} (client_id, schedule_id, teacher_id, attendance_date, attendance_session, status, check_in, notes, marked_by)
+        VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURTIME()), ?, ?)
+      `;
+
+      return pool.query(
+        insertSql,
+        [clientId, payload.schedule_id || null, payload.teacher_id, payload.attendance_date, payload.attendance_session, payload.status, payload.check_in, payload.notes, payload.marked_by],
+        (insertError) => {
+          if (insertError) {
+            return sendDatabaseError(res, insertError);
+          }
+
+          return res.status(200).json({
+            success: true,
+            message: 'Teacher attendance saved successfully'
+          });
+        }
+      );
     });
+  };
+
+  if (!scheduleSql) {
+    return saveRecord();
+  }
+
+  pool.query(scheduleSql, [payload.schedule_id], (scheduleError, schedules) => {
+    if (scheduleError) {
+      return sendDatabaseError(res, scheduleError);
+    }
+
+    return saveRecord(schedules[0]?.client_id);
   });
 }
 
@@ -1110,6 +1285,7 @@ async function saveStudentAttendance(req, res) {
 
   try {
     await ensureStudentAttendanceSchema();
+    await saveLegacySessionAttendance(normalizedRows);
   } catch (error) {
     return sendDatabaseError(res, error);
   }
@@ -1138,16 +1314,16 @@ async function saveStudentAttendance(req, res) {
       updated_at = CURRENT_TIMESTAMP
   `;
 
-  pool.query(sql, [values], (error) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  try {
+    await queryAsync(sql, [values]);
 
     return res.status(200).json({
       success: true,
       message: 'Student attendance saved successfully'
     });
-  });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
 }
 
 module.exports = {

@@ -6,7 +6,7 @@
 //   user: process.env.DB_USER,
 //   password: process.env.DB_PASSWORD,
 //   host: process.env.DB_HOST,
-//   database: process.env.DB_DATABASE,
+//   database: process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school',
 //   port: process.env.DB_PORT,
 //   waitForConnections: true,
 //   connectionLimit: 10,  // Max number of connections at a time
@@ -29,7 +29,7 @@ const pool = mysql.createPool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   host: process.env.DB_HOST,
-  database: process.env.DB_DATABASE,
+  database: process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school',
   port: process.env.DB_PORT,
   waitForConnections: true,
   connectionLimit: 10,

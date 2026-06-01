@@ -6,6 +6,7 @@ const db = pool.promise();
 const studentsTable = table('students');
 const teachersTable = table('teachers');
 const classroomsTable = table('classrooms');
+const sectionsTable = table('sections');
 const userEntityLinksTable = table('user_entity_links');
 const parentStudentLinksTable = table('parent_student_links');
 const examResultsTable = table('exam_results');
@@ -410,11 +411,12 @@ async function fetchAttendance(clientId, studentIds) {
         CONVERT(sa.status USING utf8mb4) COLLATE utf8mb4_unicode_ci AS status,
         sa.check_in,
         CONVERT(sa.notes USING utf8mb4) COLLATE utf8mb4_unicode_ci AS notes,
-        CONVERT(cs.subject USING utf8mb4) COLLATE utf8mb4_unicode_ci AS subject,
+        CONVERT(subj.sub_name USING utf8mb4) COLLATE utf8mb4_unicode_ci AS subject,
         CAST('PERIOD' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS attendance_type
       FROM ${studentAttendanceTable} sa
       LEFT JOIN ${studentsTable} s ON s.student_id = sa.student_id
       LEFT JOIN ${schedulesTable} cs ON cs.schedule_id = sa.schedule_id
+      LEFT JOIN ${subjectsTable} subj ON subj.subject_id = cs.subject_id
       WHERE cs.client_id = ?
         AND sa.student_id IN (?)
       UNION ALL
@@ -436,6 +438,16 @@ async function fetchAttendance(clientId, studentIds) {
       LEFT JOIN ${studentsTable} s ON s.student_id = a.student_id
       WHERE a.client_id = ?
         AND a.student_id IN (?)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM ${studentAttendanceTable} sa2
+          INNER JOIN ${schedulesTable} cs2 ON cs2.schedule_id = sa2.schedule_id
+          WHERE cs2.client_id = a.client_id
+            AND sa2.student_id = a.student_id
+            AND sa2.attendance_date = a.attendance_date
+            AND sa2.attendance_session IN ('Session', 'Morning', 'Afternoon')
+          LIMIT 1
+        )
     ) portal_attendance
     ORDER BY attendance_date DESC, attendance_id DESC
     LIMIT 60
@@ -638,15 +650,17 @@ async function fetchTeacherSchedules(clientId, teacherId) {
       sp.start_time,
       sp.end_time,
       sp.duration_minutes,
-      cs.subject,
-      cs.grade,
-      cs.section,
+      subj.sub_name AS subject,
+      c.name AS grade,
+      sec.section_name AS section,
       cs.day_of_week,
       cs.schedule_date,
       cs.status,
       cs.notes
     FROM ${schedulesTable} cs
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = cs.classroom_id
+    LEFT JOIN ${sectionsTable} sec ON sec.section_id = cs.section_id
+    LEFT JOIN ${subjectsTable} subj ON subj.subject_id = cs.subject_id
     LEFT JOIN ${sessionsTable} ss ON ss.session_id = cs.session_id
     LEFT JOIN ${periodsTable} sp ON sp.period_id = cs.period_id
     WHERE cs.client_id = ?
@@ -689,11 +703,7 @@ async function fetchTeacherExams(clientId, teacherId) {
       AND cs.teacher_id = ?
       AND cs.classroom_id = s.classroom_id
       AND (cs.status IS NULL OR cs.status = 'Active')
-      AND (
-        LOWER(TRIM(cs.subject)) = LOWER(TRIM(s.sub_name))
-        OR cs.subject IS NULL
-        OR s.sub_name IS NULL
-      )
+      AND (cs.subject_id = s.subject_id OR cs.subject_id IS NULL)
     WHERE e.client_id = ?
     ORDER BY e.exam_date DESC, e.exam_id DESC
     LIMIT 50
@@ -708,57 +718,75 @@ async function fetchTeacherAttendance(clientId, teacherId) {
   }
 
   const columns = await getTeacherAttendanceColumns();
+  const idColumn = columns.has('attendance_id') ? 'attendance_id' : 'teacher_attendance_id';
+  const sessionSelect = columns.has('attendance_session') ? 'ta.attendance_session' : `'Morning'`;
+  const checkInSelect = columns.has('check_in') ? 'ta.check_in' : (columns.has('check_in_time') ? 'ta.check_in_time' : 'NULL');
+  const notesSelect = columns.has('notes') ? 'ta.notes' : (columns.has('remarks') ? 'ta.remarks' : 'NULL');
+  const markedBySelect = columns.has('marked_by') ? 'ta.marked_by' : 'NULL';
+  const hasClientId = columns.has('client_id');
 
   if (!columns.has('schedule_id')) {
+    const clientFilter = hasClientId ? 'ta.client_id = ? AND ta.teacher_id = ?' : 'ta.teacher_id = ?';
+    const clientValues = hasClientId ? [clientId, teacherId] : [teacherId];
+
     const [rows] = await db.query(`
       SELECT
-        ta.attendance_id AS teacher_attendance_id,
+        ta.${idColumn} AS teacher_attendance_id,
         NULL AS schedule_id,
         ta.teacher_id,
         ta.attendance_date,
+        ${sessionSelect} AS attendance_session,
         ta.status,
-        ta.check_in_time AS check_in,
-        ta.remarks AS notes,
-        NULL AS marked_by,
+        ${checkInSelect} AS check_in,
+        ${notesSelect} AS notes,
+        ${markedBySelect} AS marked_by,
         NULL AS subject,
         NULL AS classroom_name,
         NULL AS period_label,
         NULL AS start_time,
         NULL AS end_time
       FROM ${teacherAttendanceTable} ta
-      WHERE ta.client_id = ?
-        AND ta.teacher_id = ?
-      ORDER BY ta.attendance_date DESC, ta.attendance_id DESC
+      WHERE ${clientFilter}
+      ORDER BY ta.attendance_date DESC, FIELD(${sessionSelect}, 'Morning', 'Afternoon') ASC, ta.${idColumn} DESC
       LIMIT 60
-    `, [clientId, teacherId]);
+    `, clientValues);
 
     return rows;
   }
 
+  const scheduleClientFilter = hasClientId
+    ? '(ta.client_id = ? OR cs.client_id = ? OR cs.client_id IS NULL)'
+    : '(cs.client_id = ? OR cs.client_id IS NULL)';
+  const scheduleValues = hasClientId
+    ? [teacherId, clientId, clientId]
+    : [teacherId, clientId];
+
   const [rows] = await db.query(`
     SELECT
-      ta.teacher_attendance_id,
+      ta.${idColumn} AS teacher_attendance_id,
       ta.schedule_id,
       ta.teacher_id,
       ta.attendance_date,
+      ${sessionSelect} AS attendance_session,
       ta.status,
-      ta.check_in,
-      ta.notes,
-      ta.marked_by,
-      cs.subject,
+      ${checkInSelect} AS check_in,
+      ${notesSelect} AS notes,
+      ${markedBySelect} AS marked_by,
+      subj.sub_name AS subject,
       c.name AS classroom_name,
       sp.label AS period_label,
       sp.start_time,
       sp.end_time
     FROM ${teacherAttendanceTable} ta
     LEFT JOIN ${schedulesTable} cs ON cs.schedule_id = ta.schedule_id
+    LEFT JOIN ${subjectsTable} subj ON subj.subject_id = cs.subject_id
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = cs.classroom_id
     LEFT JOIN ${periodsTable} sp ON sp.period_id = cs.period_id
     WHERE ta.teacher_id = ?
-      AND (cs.client_id = ? OR cs.client_id IS NULL)
-    ORDER BY ta.attendance_date DESC, ta.teacher_attendance_id DESC
+      AND ${scheduleClientFilter}
+    ORDER BY ta.attendance_date DESC, FIELD(${sessionSelect}, 'Morning', 'Afternoon') ASC, ta.${idColumn} DESC
     LIMIT 60
-  `, [teacherId, clientId]);
+  `, scheduleValues);
 
   return rows;
 }
