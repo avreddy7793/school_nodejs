@@ -2,8 +2,11 @@ const { pool } = require('../config');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const feesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('fee_records')}`;
+const feePaymentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('fee_payments')}`;
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
+const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
+let feePaymentSchemaReady = null;
 
 const feeColumns = [
   'monthly_fee',
@@ -57,6 +60,10 @@ function sendDatabaseError(res, error) {
   });
 }
 
+function queryAsync(sql, values = []) {
+  return pool.promise().query(sql, values);
+}
+
 function getValue(body, camelKey, snakeKey = camelKey, fallback = undefined) {
   if (body[camelKey] !== undefined) {
     return body[camelKey];
@@ -90,6 +97,47 @@ function normalizeText(value) {
 
   const trimmed = String(value).trim();
   return trimmed || null;
+}
+
+function normalizePaymentType(value) {
+  const normalized = String(value || 'PARTIAL').trim().toUpperCase();
+  const allowed = new Set(['MONTHLY', 'QUARTERLY', 'FULL', 'OTHERS', 'PARTIAL']);
+  return allowed.has(normalized) ? normalized : 'PARTIAL';
+}
+
+function today() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function ensureFeePaymentSchema() {
+  if (!feePaymentSchemaReady) {
+    feePaymentSchemaReady = (async () => {
+      await queryAsync(`
+        CREATE TABLE IF NOT EXISTS ${feePaymentsTable} (
+          payment_id INT NOT NULL AUTO_INCREMENT,
+          client_id BIGINT DEFAULT NULL,
+          fee_id INT NOT NULL,
+          receipt_no VARCHAR(40) DEFAULT NULL,
+          payment_date DATE NOT NULL,
+          payment_type VARCHAR(20) DEFAULT 'PARTIAL',
+          payment_mode VARCHAR(30) DEFAULT 'Cash',
+          amount DECIMAL(10,2) NOT NULL,
+          total_paid_after DECIMAL(10,2) DEFAULT NULL,
+          due_balance_after DECIMAL(10,2) DEFAULT NULL,
+          notes TEXT DEFAULT NULL,
+          created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (payment_id),
+          UNIQUE KEY uq_fee_payment_receipt (receipt_no),
+          KEY idx_fee_payments_client (client_id),
+          KEY idx_fee_payments_fee (fee_id),
+          CONSTRAINT fk_fee_payments_fee FOREIGN KEY (fee_id) REFERENCES ${feesTable} (fee_id) ON DELETE CASCADE,
+          CONSTRAINT fk_fee_payments_client FOREIGN KEY (client_id) REFERENCES ${clientMasterTable} (client_id)
+        )
+      `);
+    })();
+  }
+
+  return feePaymentSchemaReady;
 }
 
 function buildFeePayload(body) {
@@ -170,6 +218,47 @@ function applyTotals(payload) {
 
   payload.total = Number(total.toFixed(2));
   payload.due_balance = Number(dueBalance.toFixed(2));
+}
+
+async function insertFeePayment(connection, feeRecord, amount, options = {}) {
+  const paymentAmount = normalizeMoney(amount, 0);
+  if (!paymentAmount || paymentAmount <= 0) {
+    return null;
+  }
+
+  const paymentDate = normalizeText(getValue(options, 'paymentDate', 'payment_date')) || today();
+  const paymentType = normalizePaymentType(getValue(options, 'paymentType', 'payment_type', getValue(options, 'feeMode', 'fee_mode')));
+  const paymentMode = normalizeText(getValue(options, 'paymentMode', 'payment_mode')) || 'Cash';
+  const notes = normalizeText(getValue(options, 'paymentNotes', 'payment_notes', getValue(options, 'notes')));
+  const payload = {
+    client_id: feeRecord.client_id,
+    fee_id: feeRecord.fee_id,
+    receipt_no: null,
+    payment_date: paymentDate,
+    payment_type: paymentType,
+    payment_mode: paymentMode,
+    amount: paymentAmount,
+    total_paid_after: normalizeMoney(feeRecord.deposit, 0),
+    due_balance_after: normalizeMoney(feeRecord.due_balance, 0),
+    notes
+  };
+
+  const [result] = await connection.query(`INSERT INTO ${feePaymentsTable} SET ?`, payload);
+  const receiptNo = `${feeRecord.fee_reg_no}-PAY${String(result.insertId).padStart(4, '0')}`;
+  await connection.query(`UPDATE ${feePaymentsTable} SET receipt_no = ? WHERE payment_id = ?`, [receiptNo, result.insertId]);
+
+  return {
+    payment_id: result.insertId,
+    fee_id: feeRecord.fee_id,
+    receipt_no: receiptNo,
+    payment_date: paymentDate,
+    payment_type: paymentType,
+    payment_mode: paymentMode,
+    amount: paymentAmount,
+    total_paid_after: payload.total_paid_after,
+    due_balance_after: payload.due_balance_after,
+    notes
+  };
 }
 
 function getNextFeeRegNo(callback) {
@@ -272,7 +361,13 @@ function getFeeRecordById(req, res) {
   });
 }
 
-function createFeeRecord(req, res) {
+async function createFeeRecord(req, res) {
+  try {
+    await ensureFeePaymentSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
   const payload = buildFeePayload(req.body);
 
   if (!payload.client_id || !payload.student_id || !payload.classroom_id || !payload.fee_year) {
@@ -289,47 +384,64 @@ function createFeeRecord(req, res) {
     });
   }
 
-  const insertFeeRecord = () => {
-    const studentSql = `
-      SELECT student_id
-      FROM ${studentsTable}
-      WHERE student_id = ?
-        AND (? IS NULL OR client_id = ?)
-        AND class_name = ?
-    `;
+  const insertFeeRecord = async () => {
+    let connection;
+    try {
+      connection = await pool.promise().getConnection();
+      await connection.beginTransaction();
 
-    pool.query(studentSql, [payload.student_id, payload.client_id, payload.client_id, payload.classroom_id], (studentError, students) => {
-      if (studentError) {
-        return sendDatabaseError(res, studentError);
-      }
+      const studentSql = `
+        SELECT student_id
+        FROM ${studentsTable}
+        WHERE student_id = ?
+          AND (? IS NULL OR client_id = ?)
+          AND class_name = ?
+      `;
+
+      const [students] = await connection.query(studentSql, [payload.student_id, payload.client_id, payload.client_id, payload.classroom_id]);
 
       if (!students.length) {
+        await connection.rollback();
         return res.status(400).json({
           success: false,
           message: 'Choose a valid student from the selected class'
         });
       }
 
-      pool.query(`INSERT INTO ${feesTable} SET ?`, payload, (error, result) => {
-        if (error) {
-          if (error.code === 'ER_DUP_ENTRY') {
-            return res.status(409).json({
-              success: false,
-              message: 'Fee record already exists for this student and year'
-            });
-          }
+      const [result] = await connection.query(`INSERT INTO ${feesTable} SET ?`, payload);
+      const feeRecord = {
+        ...payload,
+        fee_id: result.insertId
+      };
+      const payment = await insertFeePayment(connection, feeRecord, payload.deposit, req.body);
 
-          return sendDatabaseError(res, error);
-        }
+      await connection.commit();
 
-        return res.status(201).json({
-          success: true,
-          message: 'Fee record saved successfully',
-          fee_id: result.insertId,
-          fee_reg_no: payload.fee_reg_no
-        });
+      return res.status(201).json({
+        success: true,
+        message: 'Fee record saved successfully',
+        fee_id: result.insertId,
+        fee_reg_no: payload.fee_reg_no,
+        payment
       });
-    });
+    } catch (error) {
+      if (connection) {
+        await connection.rollback();
+      }
+
+      if (error.code === 'ER_DUP_ENTRY') {
+        return res.status(409).json({
+          success: false,
+          message: 'Fee record already exists for this student and year'
+        });
+      }
+
+      return sendDatabaseError(res, error);
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
   };
 
   if (payload.fee_reg_no) {
@@ -347,7 +459,13 @@ function createFeeRecord(req, res) {
   });
 }
 
-function updateFeeRecord(req, res) {
+async function updateFeeRecord(req, res) {
+  try {
+    await ensureFeePaymentSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
   const payload = buildFeeUpdatePayload(req.body);
 
   if (!Object.keys(payload).length) {
@@ -364,13 +482,16 @@ function updateFeeRecord(req, res) {
     });
   }
 
-  const currentSql = `SELECT * FROM ${feesTable} WHERE fee_id = ?`;
-  pool.query(currentSql, [req.params.feeId], (currentError, records) => {
-    if (currentError) {
-      return sendDatabaseError(res, currentError);
-    }
+  let connection;
+  try {
+    connection = await pool.promise().getConnection();
+    await connection.beginTransaction();
+
+    const currentSql = `SELECT * FROM ${feesTable} WHERE fee_id = ? FOR UPDATE`;
+    const [records] = await connection.query(currentSql, [req.params.feeId]);
 
     if (!records.length) {
+      await connection.rollback();
       return res.status(404).json({
         success: false,
         message: 'Fee record not found'
@@ -381,23 +502,79 @@ function updateFeeRecord(req, res) {
     applyTotals(mergedPayload);
     payload.total = mergedPayload.total;
     payload.due_balance = mergedPayload.due_balance;
+    const previousDeposit = Number(records[0].deposit || 0);
+    const nextDeposit = Number(mergedPayload.deposit || 0);
+    const paymentAmount = payload.deposit !== undefined ? Number((nextDeposit - previousDeposit).toFixed(2)) : 0;
 
-    pool.query(`UPDATE ${feesTable} SET ? WHERE fee_id = ?`, [payload, req.params.feeId], (error) => {
-      if (error) {
-        if (error.code === 'ER_DUP_ENTRY') {
-          return res.status(409).json({
-            success: false,
-            message: 'Fee record already exists for this student and year'
-          });
-        }
+    await connection.query(`UPDATE ${feesTable} SET ? WHERE fee_id = ?`, [payload, req.params.feeId]);
+    const payment = await insertFeePayment(connection, {
+      ...mergedPayload,
+      fee_id: Number(req.params.feeId)
+    }, paymentAmount, req.body);
 
-        return sendDatabaseError(res, error);
-      }
+    await connection.commit();
 
-      return res.status(200).json({
-        success: true,
-        message: 'Fee record updated successfully'
+    return res.status(200).json({
+      success: true,
+      message: 'Fee record updated successfully',
+      payment
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({
+        success: false,
+        message: 'Fee record already exists for this student and year'
       });
+    }
+
+    return sendDatabaseError(res, error);
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+}
+
+async function getFeePayments(req, res) {
+  try {
+    await ensureFeePaymentSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
+  const clientId = req.query.client_id;
+  const sql = `
+    SELECT
+      fp.payment_id,
+      fp.client_id,
+      fp.fee_id,
+      fp.receipt_no,
+      fp.payment_date,
+      fp.payment_type,
+      fp.payment_mode,
+      fp.amount,
+      fp.total_paid_after,
+      fp.due_balance_after,
+      fp.notes,
+      fp.created_at
+    FROM ${feePaymentsTable} fp
+    INNER JOIN ${feesTable} fr ON fr.fee_id = fp.fee_id
+    WHERE fp.fee_id = ? AND (? IS NULL OR fp.client_id = ? OR fr.client_id = ?)
+    ORDER BY fp.payment_date DESC, fp.payment_id DESC
+  `;
+
+  pool.query(sql, [req.params.feeId, clientId || null, clientId || null, clientId || null], (error, results) => {
+    if (error) {
+      return sendDatabaseError(res, error);
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: results
     });
   });
 }
@@ -425,6 +602,7 @@ function deleteFeeRecord(req, res) {
 module.exports = {
   getFeeRecords,
   getFeeRecordById,
+  getFeePayments,
   createFeeRecord,
   updateFeeRecord,
   deleteFeeRecord

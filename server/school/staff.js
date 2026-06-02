@@ -20,6 +20,7 @@ const selectableColumns = `
   address,
   joiningDate,
   status,
+  salary,
   createdAt,
   updatedAt
 `;
@@ -91,6 +92,15 @@ function normalizeStatus(value) {
   return statuses.has(status) ? status : 'ACTIVATE';
 }
 
+function normalizeDecimal(value, fallback = null) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
 function buildStaffPayload(body) {
   return {
     client_id: normalizePositiveInteger(getValue(body, 'clientId', 'client_id')),
@@ -102,7 +112,8 @@ function buildStaffPayload(body) {
     email: normalizeText(getValue(body, 'email')),
     address: normalizeText(getValue(body, 'address')),
     joiningDate: normalizeText(getValue(body, 'joiningDate', 'joining_date', today())),
-    status: normalizeStatus(getValue(body, 'status'))
+    status: normalizeStatus(getValue(body, 'status')),
+    salary: normalizeDecimal(getValue(body, 'salary'))
   };
 }
 
@@ -126,7 +137,8 @@ function buildStaffUpdatePayload(body) {
     email: 'email',
     address: 'address',
     joiningDate: 'joiningDate',
-    status: 'status'
+    status: 'status',
+    salary: 'salary'
   };
   const payload = {};
 
@@ -149,6 +161,11 @@ function buildStaffUpdatePayload(body) {
 
     if (column === 'status') {
       payload[column] = normalizeStatus(value);
+      return;
+    }
+
+    if (column === 'salary') {
+      payload[column] = normalizeDecimal(value);
       return;
     }
 
