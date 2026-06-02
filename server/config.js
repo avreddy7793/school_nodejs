@@ -1,36 +1,22 @@
-// var fs = require('fs');
-// var mysql = require('mysql2');
 
-// var connection = mysql.createConnection({
-
-//   user: process.env.DB_USER,
-//   password: process.env.DB_PASSWORD,
-//   host: process.env.DB_HOST,
-//   database: process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school',
-//   port: process.env.DB_PORT,
-//   waitForConnections: true,
-//   connectionLimit: 10,  // Max number of connections at a time
-//   queueLimit: 0 ,
-//   timezone: '+05:30' // Set India Time Zone
-// });
-// connection.connect(function (err) {
-//   if (err) throw err;
-//   console.log("Node Server started and Database Connected Successfully");
-// });
-
-// module.exports = connection;
-
-// module.exports.secret = 'AVR_developers_working';
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '..', 'lot.env.local') });
+require('dotenv').config();
 
 const mysql = require('mysql2');
 
+function envValue(key, fallback = undefined) {
+  const value = process.env[key];
+  return typeof value === 'string' ? value.trim() : fallback;
+}
+
 // Create a pool of connections
 const pool = mysql.createPool({
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  host: process.env.DB_HOST,
-  database: process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school',
-  port: process.env.DB_PORT,
+  user: envValue('DB_USER'),
+  password: envValue('DB_PASSWORD'),
+  host: envValue('DB_HOST'),
+  database: envValue('DB_SCHOOL_DATABASE') || envValue('DB_DATABASE') || 'school',
+  port: envValue('DB_PORT', 3306),
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,

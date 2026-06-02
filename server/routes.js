@@ -16,6 +16,8 @@ const teacherLeavesRouter = require("./school/teacher-leaves.router");
 const hostelRouter = require("./school/hostel.router");
 const portalRouter = require("./school/portal.router");
 const timetableRouter = require("./school/timetable.router");
+const settingsRouter = require("./school/settings.router");
+const salaryRouter = require("./school/salary.router");
 
 const multer = require('multer');
 const storage = multer.diskStorage({
@@ -68,5 +70,9 @@ module.exports = function (app) {
   app.use("/api/hostel", hostelRouter);
   app.use("/api/school/portal", db.checkToken, portalRouter);
   app.use("/api/portal", db.checkToken, portalRouter);
+  app.use("/api/school/settings", settingsRouter);
+  app.use("/api/settings", settingsRouter);
+  app.use("/api/school/salaries", salaryRouter);
+  app.use("/api/salaries", salaryRouter);
 
 };
