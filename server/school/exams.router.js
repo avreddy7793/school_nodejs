@@ -7,11 +7,13 @@ const router = express.Router();
 router.get('/subjects', subjects.getSubjects);
 router.get('/results', exams.getExamResults);
 router.post('/results', exams.createExamResult);
+router.put('/results/:resultId', exams.updateExamResult);
 router.delete('/results/:resultId', exams.deleteExamResult);
 router.get('/', exams.getExams);
 router.get('/:examId', exams.getExamById);
 router.get('/:examId/results', exams.getExamResults);
 router.post('/', exams.createExam);
+router.put('/:examId/close', exams.closeExam);
 router.put('/:examId', exams.updateExam);
 router.delete('/:examId', exams.deleteExam);
 

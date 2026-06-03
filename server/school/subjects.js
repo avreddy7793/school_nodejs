@@ -3,6 +3,7 @@ const { pool } = require('../config');
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('subjects')}`;
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
+const schedulesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('class_schedule')}`;
 
 const selectableColumns = `
   s.subject_id,
@@ -97,7 +98,7 @@ function buildSubjectUpdatePayload(body) {
 }
 
 function getSubjects(req, res) {
-  const { client_id, classroom_id, search } = req.query;
+  const { client_id, classroom_id, search, teacher_id } = req.query;
   const conditions = [];
   const values = [];
 
@@ -109,6 +110,18 @@ function getSubjects(req, res) {
   if (classroom_id) {
     conditions.push('s.classroom_id = ?');
     values.push(classroom_id);
+  }
+
+  if (teacher_id) {
+    conditions.push(`EXISTS (
+      SELECT 1
+      FROM ${schedulesTable} cs
+      WHERE cs.subject_id = s.subject_id
+        AND cs.classroom_id = s.classroom_id
+        AND cs.teacher_id = ?
+        AND (cs.status IS NULL OR cs.status = 'Active')
+    )`);
+    values.push(teacher_id);
   }
 
   if (search) {
