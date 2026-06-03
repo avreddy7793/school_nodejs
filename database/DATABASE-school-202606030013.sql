@@ -401,6 +401,9 @@ CREATE TABLE `exams` (
   `exam_id` int NOT NULL AUTO_INCREMENT,
   `client_id` bigint NOT NULL,
   `subject_id` int NOT NULL,
+  `exam_type` enum('Unit Test 1','Unit Test 2','Half Yearly','Unit Test 3','Unit Test 4','Pre Final','Final Exam','Other') NOT NULL DEFAULT 'Other',
+  `syllabus_unit_id` int DEFAULT NULL,
+  `academic_year` varchar(20) DEFAULT NULL,
   `exam_date` date NOT NULL,
   `total_marks` int NOT NULL,
   `passing_marks` int NOT NULL,
@@ -409,8 +412,10 @@ CREATE TABLE `exams` (
   PRIMARY KEY (`exam_id`),
   KEY `subject_id` (`subject_id`),
   KEY `exams_client_master_FK` (`client_id`),
+  KEY `exams_syllabus_unit_fk` (`syllabus_unit_id`),
   CONSTRAINT `exams_client_master_FK` FOREIGN KEY (`client_id`) REFERENCES `client_master` (`client_id`),
-  CONSTRAINT `exams_ibfk_1` FOREIGN KEY (`subject_id`) REFERENCES `subjects` (`subject_id`)
+  CONSTRAINT `exams_ibfk_1` FOREIGN KEY (`subject_id`) REFERENCES `subjects` (`subject_id`),
+  CONSTRAINT `exams_syllabus_unit_fk` FOREIGN KEY (`syllabus_unit_id`) REFERENCES `syllabus_units` (`syllabus_unit_id`) ON DELETE SET NULL
 ) ENGINE=InnoDB AUTO_INCREMENT=11 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
@@ -420,7 +425,7 @@ CREATE TABLE `exams` (
 
 LOCK TABLES `exams` WRITE;
 /*!40000 ALTER TABLE `exams` DISABLE KEYS */;
-INSERT INTO `exams` VALUES (10,23,38,'2026-05-20',100,35,60,'2026-05-31 05:53:19');
+INSERT INTO `exams` VALUES (10,23,38,'Other',NULL,NULL,'2026-05-20',100,35,60,'2026-05-31 05:53:19');
 /*!40000 ALTER TABLE `exams` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -721,7 +726,7 @@ CREATE TABLE `salary_payments` (
   CONSTRAINT `salary_payments_item_FK` FOREIGN KEY (`payroll_item_id`) REFERENCES `salary_payroll_items` (`payroll_item_id`) ON DELETE CASCADE,
   CONSTRAINT `salary_payments_paid_by_FK` FOREIGN KEY (`paid_by`) REFERENCES `login` (`login_id`),
   CONSTRAINT `chk_salary_payment_amount` CHECK ((`amount` > 0))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -730,6 +735,7 @@ CREATE TABLE `salary_payments` (
 
 LOCK TABLES `salary_payments` WRITE;
 /*!40000 ALTER TABLE `salary_payments` DISABLE KEYS */;
+INSERT INTO `salary_payments` VALUES (1,12,23,'2026-06-02',1666.67,'Bank Transfer',NULL,NULL,NULL,'2026-06-02 18:15:17'),(2,13,23,'2026-06-02',1166.67,'Bank Transfer',NULL,NULL,NULL,'2026-06-02 18:15:21'),(3,14,23,'2026-06-02',666.67,'Bank Transfer',NULL,NULL,NULL,'2026-06-02 18:15:25'),(4,5,23,'2026-06-02',416.67,'Bank Transfer',NULL,NULL,NULL,'2026-06-02 18:15:34');
 /*!40000 ALTER TABLE `salary_payments` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -786,7 +792,7 @@ CREATE TABLE `salary_payroll_items` (
   CONSTRAINT `salary_items_teacher_FK` FOREIGN KEY (`teacher_id`) REFERENCES `teachers` (`teacher_id`),
   CONSTRAINT `chk_salary_item_amounts` CHECK (((`base_salary` >= 0) and (`attendance_deduction` >= 0) and (`late_deduction` >= 0) and (`manual_deduction` >= 0) and (`bonus_amount` >= 0) and (`gross_salary` >= 0) and (`net_salary` >= 0) and (`paid_amount` >= 0) and (`balance_amount` >= 0))),
   CONSTRAINT `chk_salary_item_entity` CHECK ((((`employee_type` = _utf8mb4'TEACHER') and (`teacher_id` is not null) and (`staff_id` is null)) or ((`employee_type` = _utf8mb4'STAFF') and (`staff_id` is not null) and (`teacher_id` is null))))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=15 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -795,6 +801,7 @@ CREATE TABLE `salary_payroll_items` (
 
 LOCK TABLES `salary_payroll_items` WRITE;
 /*!40000 ALTER TABLE `salary_payroll_items` DISABLE KEYS */;
+INSERT INTO `salary_payroll_items` (`payroll_item_id`, `payroll_run_id`, `client_id`, `salary_profile_id`, `employee_type`, `teacher_id`, `staff_id`, `employee_name`, `base_salary`, `working_days`, `expected_sessions`, `present_sessions`, `late_sessions`, `absent_sessions`, `leave_sessions`, `paid_leave_sessions`, `payable_sessions`, `per_session_rate`, `attendance_deduction`, `late_deduction`, `manual_deduction`, `bonus_amount`, `gross_salary`, `net_salary`, `paid_amount`, `balance_amount`, `payment_status`, `notes`, `created_at`, `updated_at`) VALUES (1,1,23,4,'TEACHER',12,NULL,'HARI KRISHNA K',0.00,30.00,60,0,0,60,0,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:21','2026-06-02 18:08:21'),(2,1,23,5,'TEACHER',13,NULL,'KASIM SAHEB SIRICHAPALA',0.00,30.00,60,0,0,60,0,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:21','2026-06-02 18:08:21'),(3,1,23,3,'TEACHER',11,NULL,'RAVITEJA MADASU',0.00,30.00,60,0,0,60,0,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:21','2026-06-02 18:08:21'),(4,1,23,6,'TEACHER',14,NULL,'SIVAREDDY E',0.00,30.00,60,0,0,60,0,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:21','2026-06-02 18:08:21'),(5,1,23,1,'TEACHER',9,NULL,'SREEDEVI ANNAREDDY',25000.00,30.00,60,1,0,59,0,0.00,1.00,416.67,24583.33,0.00,0.00,0.00,25000.00,416.67,416.67,0.00,'Paid',NULL,'2026-06-02 18:08:21','2026-06-02 18:15:34'),(6,1,23,2,'TEACHER',10,NULL,'VIVEKANADAN REDDY YERUVA',35000.00,30.00,60,0,0,60,0,0.00,0.00,583.33,35000.00,0.00,0.00,0.00,35000.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:21','2026-06-02 18:08:21'),(7,1,23,8,'STAFF',NULL,17,'KIRAN KUMAR REDDY AMBATI',20000.00,30.00,60,0,0,60,0,0.00,0.00,333.33,20000.00,0.00,0.00,0.00,20000.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:21','2026-06-02 18:08:21'),(8,2,23,4,'TEACHER',12,NULL,'HARI KRISHNA K',0.00,30.00,60,0,0,60,0,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:30','2026-06-02 18:08:30'),(9,2,23,5,'TEACHER',13,NULL,'KASIM SAHEB SIRICHAPALA',0.00,30.00,60,4,0,56,0,0.00,4.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:30','2026-06-02 18:08:30'),(10,2,23,3,'TEACHER',11,NULL,'RAVITEJA MADASU',0.00,30.00,60,3,0,57,0,0.00,3.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:30','2026-06-02 18:08:30'),(11,2,23,6,'TEACHER',14,NULL,'SIVAREDDY E',0.00,30.00,60,0,0,60,0,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,0.00,'Paid',NULL,'2026-06-02 18:08:30','2026-06-02 18:08:30'),(12,2,23,1,'TEACHER',9,NULL,'SREEDEVI ANNAREDDY',25000.00,30.00,60,4,0,56,0,0.00,4.00,416.67,23333.33,0.00,0.00,0.00,25000.00,1666.67,1666.67,0.00,'Paid',NULL,'2026-06-02 18:08:30','2026-06-02 18:15:17'),(13,2,23,2,'TEACHER',10,NULL,'VIVEKANADAN REDDY YERUVA',35000.00,30.00,60,2,0,58,0,0.00,2.00,583.33,33833.33,0.00,0.00,0.00,35000.00,1166.67,1166.67,0.00,'Paid',NULL,'2026-06-02 18:08:30','2026-06-02 18:15:21'),(14,2,23,8,'STAFF',NULL,17,'KIRAN KUMAR REDDY AMBATI',20000.00,30.00,60,2,0,58,0,0.00,2.00,333.33,19333.33,0.00,0.00,0.00,20000.00,666.67,666.67,0.00,'Paid',NULL,'2026-06-02 18:08:30','2026-06-02 18:15:25');
 /*!40000 ALTER TABLE `salary_payroll_items` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -834,7 +841,7 @@ CREATE TABLE `salary_payroll_runs` (
   CONSTRAINT `salary_payroll_runs_generated_by_FK` FOREIGN KEY (`generated_by`) REFERENCES `login` (`login_id`),
   CONSTRAINT `chk_salary_payroll_dates` CHECK (((`period_start` <= `period_end`) and (`attendance_from` <= `attendance_to`))),
   CONSTRAINT `chk_salary_payroll_period` CHECK (((`payroll_month` between 1 and 12) and (`payroll_year` between 2000 and 2100)))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -843,6 +850,7 @@ CREATE TABLE `salary_payroll_runs` (
 
 LOCK TABLES `salary_payroll_runs` WRITE;
 /*!40000 ALTER TABLE `salary_payroll_runs` DISABLE KEYS */;
+INSERT INTO `salary_payroll_runs` VALUES (1,23,5,2026,'2026-05-01','2026-05-31','2026-05-01','2026-05-31',30.00,60,'Paid',NULL,NULL,'2026-06-02 18:08:22',NULL,NULL,'2026-06-02 18:08:21','2026-06-02 18:15:34'),(2,23,6,2026,'2026-06-01','2026-06-30','2026-06-01','2026-06-30',30.00,60,'Paid',NULL,NULL,'2026-06-02 18:08:30',NULL,NULL,'2026-06-02 18:08:30','2026-06-02 18:15:25');
 /*!40000 ALTER TABLE `salary_payroll_runs` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -883,7 +891,7 @@ CREATE TABLE `salary_profiles` (
   CONSTRAINT `salary_profiles_teacher_FK` FOREIGN KEY (`teacher_id`) REFERENCES `teachers` (`teacher_id`),
   CONSTRAINT `chk_salary_profile_amounts` CHECK (((`monthly_salary` >= 0) and (`late_penalty_amount` >= 0) and (`paid_leave_sessions` >= 0))),
   CONSTRAINT `chk_salary_profile_entity` CHECK ((((`employee_type` = _utf8mb4'TEACHER') and (`teacher_id` is not null) and (`staff_id` is null)) or ((`employee_type` = _utf8mb4'STAFF') and (`staff_id` is not null) and (`teacher_id` is null))))
-) ENGINE=InnoDB AUTO_INCREMENT=9 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=19 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -892,7 +900,7 @@ CREATE TABLE `salary_profiles` (
 
 LOCK TABLES `salary_profiles` WRITE;
 /*!40000 ALTER TABLE `salary_profiles` DISABLE KEYS */;
-INSERT INTO `salary_profiles` (`salary_profile_id`, `client_id`, `employee_type`, `teacher_id`, `staff_id`, `monthly_salary`, `salary_mode`, `working_days_per_month`, `session_rate`, `late_penalty_amount`, `paid_leave_sessions`, `bank_account_number`, `ifsc_code`, `payment_method`, `effective_from`, `status`, `notes`, `created_at`, `updated_at`) VALUES (1,23,'TEACHER',9,NULL,25000.00,'MONTHLY',NULL,NULL,0.00,0.00,'20187508385','sbin0006694','Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 17:42:32'),(2,23,'TEACHER',10,NULL,35000.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 17:42:32'),(3,23,'TEACHER',11,NULL,0.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 17:42:32'),(4,23,'TEACHER',12,NULL,0.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 17:42:32'),(5,23,'TEACHER',13,NULL,0.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 17:42:32'),(6,23,'TEACHER',14,NULL,0.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 17:42:32'),(8,23,'STAFF',NULL,17,0.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:42','2026-06-02 17:42:42');
+INSERT INTO `salary_profiles` (`salary_profile_id`, `client_id`, `employee_type`, `teacher_id`, `staff_id`, `monthly_salary`, `salary_mode`, `working_days_per_month`, `session_rate`, `late_penalty_amount`, `paid_leave_sessions`, `bank_account_number`, `ifsc_code`, `payment_method`, `effective_from`, `status`, `notes`, `created_at`, `updated_at`) VALUES (1,23,'TEACHER',9,NULL,25000.00,'MONTHLY',NULL,NULL,0.00,0.00,'20187508385','sbin0006694','Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 18:15:44'),(2,23,'TEACHER',10,NULL,35000.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 18:15:44'),(3,23,'TEACHER',11,NULL,0.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 18:15:44'),(4,23,'TEACHER',12,NULL,0.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 18:15:44'),(5,23,'TEACHER',13,NULL,39999.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 18:15:44'),(6,23,'TEACHER',14,NULL,25000.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:32','2026-06-02 18:15:44'),(8,23,'STAFF',NULL,17,20000.00,'MONTHLY',NULL,NULL,0.00,0.00,NULL,NULL,'Bank Transfer',NULL,'ACTIVE',NULL,'2026-06-02 17:42:42','2026-06-02 18:15:44');
 /*!40000 ALTER TABLE `salary_profiles` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -1061,7 +1069,7 @@ CREATE TABLE `staff` (
 
 LOCK TABLES `staff` WRITE;
 /*!40000 ALTER TABLE `staff` DISABLE KEYS */;
-INSERT INTO `staff` VALUES (17,23,'STF001','KIRAN KUMAR REDDY','AMBATI','SUPERVISOR','8712132535','kirankumareddy@gmail.com',NULL,'2026-01-01','ACTIVATE','2026-06-01 17:40:07','2026-06-01 17:40:07',NULL);
+INSERT INTO `staff` VALUES (17,23,'STF001','KIRAN KUMAR REDDY','AMBATI','SUPERVISOR','8712132535','kirankumareddy@gmail.com',NULL,'2026-01-01','ACTIVATE','2026-06-01 17:40:07','2026-06-02 17:51:53',20000.00);
 /*!40000 ALTER TABLE `staff` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -1299,6 +1307,73 @@ INSERT INTO `subjects` VALUES (34,23,10,'TELUGU',100,'2026-05-30 16:29:45','2026
 UNLOCK TABLES;
 
 --
+-- Table structure for table `syllabus_plans`
+--
+
+DROP TABLE IF EXISTS `syllabus_plans`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `syllabus_plans` (
+  `syllabus_plan_id` int NOT NULL AUTO_INCREMENT,
+  `client_id` bigint NOT NULL,
+  `classroom_id` int NOT NULL,
+  `subject_id` int NOT NULL,
+  `academic_year` varchar(20) NOT NULL,
+  `status` enum('Not Started','In Progress','Completed') NOT NULL DEFAULT 'Not Started',
+  `notes` text,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`syllabus_plan_id`),
+  UNIQUE KEY `uq_syllabus_plan_scope` (`client_id`,`classroom_id`,`subject_id`,`academic_year`),
+  KEY `idx_syllabus_plan_class_year` (`client_id`,`classroom_id`,`academic_year`),
+  KEY `idx_syllabus_plan_subject` (`subject_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `syllabus_plans`
+--
+
+LOCK TABLES `syllabus_plans` WRITE;
+/*!40000 ALTER TABLE `syllabus_plans` DISABLE KEYS */;
+/*!40000 ALTER TABLE `syllabus_plans` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
+-- Table structure for table `syllabus_units`
+--
+
+DROP TABLE IF EXISTS `syllabus_units`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `syllabus_units` (
+  `syllabus_unit_id` int NOT NULL AUTO_INCREMENT,
+  `syllabus_plan_id` int NOT NULL,
+  `unit_title` varchar(180) NOT NULL,
+  `topics` text,
+  `target_date` date DEFAULT NULL,
+  `completed_date` date DEFAULT NULL,
+  `status` enum('Not Started','In Progress','Completed') NOT NULL DEFAULT 'Not Started',
+  `sort_order` int NOT NULL DEFAULT '0',
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`syllabus_unit_id`),
+  KEY `idx_syllabus_units_plan` (`syllabus_plan_id`),
+  KEY `idx_syllabus_units_status` (`status`),
+  CONSTRAINT `syllabus_units_plan_fk` FOREIGN KEY (`syllabus_plan_id`) REFERENCES `syllabus_plans` (`syllabus_plan_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `syllabus_units`
+--
+
+LOCK TABLES `syllabus_units` WRITE;
+/*!40000 ALTER TABLE `syllabus_units` DISABLE KEYS */;
+/*!40000 ALTER TABLE `syllabus_units` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
 -- Table structure for table `teacher_attendance`
 --
 
@@ -1435,7 +1510,7 @@ CREATE TABLE `teacher_subjects` (
   CONSTRAINT `fk_teacher_subjects_subject` FOREIGN KEY (`subject_id`) REFERENCES `subjects` (`subject_id`) ON DELETE CASCADE,
   CONSTRAINT `fk_teacher_subjects_teacher` FOREIGN KEY (`teacher_id`) REFERENCES `teachers` (`teacher_id`) ON DELETE CASCADE,
   CONSTRAINT `teacher_subjects_client_master_FK` FOREIGN KEY (`client_id`) REFERENCES `client_master` (`client_id`)
-) ENGINE=InnoDB AUTO_INCREMENT=16 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+) ENGINE=InnoDB AUTO_INCREMENT=20 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -1444,7 +1519,7 @@ CREATE TABLE `teacher_subjects` (
 
 LOCK TABLES `teacher_subjects` WRITE;
 /*!40000 ALTER TABLE `teacher_subjects` DISABLE KEYS */;
-INSERT INTO `teacher_subjects` VALUES (2,23,9,37,'2026-05-31 01:06:24','2026-05-31 01:06:24'),(3,23,9,43,'2026-05-31 01:06:24','2026-05-31 01:06:24'),(4,23,10,36,'2026-05-31 03:51:23','2026-05-31 03:51:23'),(5,23,10,39,'2026-05-31 03:51:23','2026-05-31 03:51:23'),(6,23,10,44,'2026-05-31 03:51:23','2026-05-31 03:51:23'),(7,23,10,46,'2026-05-31 03:51:23','2026-05-31 03:51:23'),(8,23,11,40,'2026-05-31 03:52:26','2026-05-31 03:52:26'),(9,23,11,47,'2026-05-31 03:52:26','2026-05-31 03:52:26'),(10,23,12,34,'2026-05-31 03:53:47','2026-05-31 03:53:47'),(11,23,12,41,'2026-05-31 03:53:47','2026-05-31 03:53:47'),(12,23,13,35,'2026-05-31 03:54:51','2026-05-31 03:54:51'),(13,23,13,42,'2026-05-31 03:54:51','2026-05-31 03:54:51'),(14,23,14,38,'2026-05-31 03:56:16','2026-05-31 03:56:16'),(15,23,14,45,'2026-05-31 03:56:16','2026-05-31 03:56:16');
+INSERT INTO `teacher_subjects` VALUES (2,23,9,37,'2026-05-31 01:06:24','2026-05-31 01:06:24'),(3,23,9,43,'2026-05-31 01:06:24','2026-05-31 01:06:24'),(4,23,10,36,'2026-05-31 03:51:23','2026-05-31 03:51:23'),(5,23,10,39,'2026-05-31 03:51:23','2026-05-31 03:51:23'),(6,23,10,44,'2026-05-31 03:51:23','2026-05-31 03:51:23'),(7,23,10,46,'2026-05-31 03:51:23','2026-05-31 03:51:23'),(8,23,11,40,'2026-05-31 03:52:26','2026-05-31 03:52:26'),(9,23,11,47,'2026-05-31 03:52:26','2026-05-31 03:52:26'),(10,23,12,34,'2026-05-31 03:53:47','2026-05-31 03:53:47'),(11,23,12,41,'2026-05-31 03:53:47','2026-05-31 03:53:47'),(16,23,14,38,'2026-06-02 18:08:58','2026-06-02 18:08:58'),(17,23,14,45,'2026-06-02 18:08:58','2026-06-02 18:08:58'),(18,23,13,35,'2026-06-02 18:09:09','2026-06-02 18:09:09'),(19,23,13,42,'2026-06-02 18:09:09','2026-06-02 18:09:09');
 /*!40000 ALTER TABLE `teacher_subjects` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -1502,7 +1577,7 @@ CREATE TABLE `teachers` (
 
 LOCK TABLES `teachers` WRITE;
 /*!40000 ALTER TABLE `teachers` DISABLE KEYS */;
-INSERT INTO `teachers` VALUES (9,23,'SREEDEVI',NULL,'ANNAREDDY','2001-10-30','Female',NULL,NULL,'8341897793',NULL,'SREEVENKAT0804@GMAIL.COM',NULL,NULL,NULL,NULL,NULL,NULL,'2025-06-01','Active',NULL,NULL,NULL,0,'ENGLISH, ENGLISH',25000.00,'20187508385','sbin0006694',NULL,'2026-05-31 01:06:24','2026-05-31 01:06:24',NULL,NULL),(10,23,'VIVEKANADAN REDDY',NULL,'YERUVA','1993-08-01','Male',NULL,NULL,'9912381646',NULL,'saivivek1994@gmail.com',NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01','Active',NULL,NULL,NULL,0,'MATHS, MATHS, PS, PS',35000.00,NULL,NULL,NULL,'2026-05-31 03:51:23','2026-05-31 03:51:23',NULL,NULL),(11,23,'RAVITEJA',NULL,'MADASU','1993-01-01','Male',NULL,NULL,'89016415617',NULL,'raviteja1993@gmail.com',NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01','Active',NULL,NULL,NULL,0,'SOCIAL, SOCIAL',NULL,NULL,NULL,NULL,'2026-05-31 03:52:26','2026-05-31 03:52:26',NULL,NULL),(12,23,'HARI KRISHNA',NULL,'K','1994-01-01','Male',NULL,NULL,'8012345679',NULL,'harikrishna.k@gmail.com',NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01','Active',NULL,NULL,NULL,0,'TELUGU, TELUGU',NULL,NULL,NULL,NULL,'2026-05-31 03:53:47','2026-05-31 03:53:47',NULL,NULL),(13,23,'KASIM SAHEB',NULL,'SIRICHAPALA','1993-01-01','Male',NULL,NULL,'7288822253',NULL,'kasimsaheb.sirichapala@gmail.com',NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01','Active',NULL,NULL,NULL,0,'HINDI, HINDI',NULL,NULL,NULL,NULL,'2026-05-31 03:54:51','2026-05-31 03:54:51',NULL,NULL),(14,23,'SIVAREDDY',NULL,'E','1993-01-01','Male',NULL,NULL,'9012345678',NULL,'SIVAREDDYENAKONDA@GMAIL.COM',NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01','Active',NULL,NULL,NULL,0,'NS, NS',NULL,NULL,NULL,NULL,'2026-05-31 03:56:16','2026-05-31 03:56:16',NULL,NULL);
+INSERT INTO `teachers` VALUES (9,23,'SREEDEVI',NULL,'ANNAREDDY','2001-10-30','Female',NULL,NULL,'8341897793',NULL,'SREEVENKAT0804@GMAIL.COM',NULL,NULL,NULL,NULL,NULL,NULL,'2025-06-01','Active',NULL,NULL,NULL,0,'ENGLISH, ENGLISH',25000.00,'20187508385','sbin0006694',NULL,'2026-05-31 01:06:24','2026-05-31 01:06:24',NULL,NULL),(10,23,'VIVEKANADAN REDDY',NULL,'YERUVA','1993-08-01','Male',NULL,NULL,'9912381646',NULL,'saivivek1994@gmail.com',NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01','Active',NULL,NULL,NULL,0,'MATHS, MATHS, PS, PS',35000.00,NULL,NULL,NULL,'2026-05-31 03:51:23','2026-05-31 03:51:23',NULL,NULL),(11,23,'RAVITEJA',NULL,'MADASU','1993-01-01','Male',NULL,NULL,'89016415617',NULL,'raviteja1993@gmail.com',NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01','Active',NULL,NULL,NULL,0,'SOCIAL, SOCIAL',NULL,NULL,NULL,NULL,'2026-05-31 03:52:26','2026-05-31 03:52:26',NULL,NULL),(12,23,'HARI KRISHNA',NULL,'K','1994-01-01','Male',NULL,NULL,'8012345679',NULL,'harikrishna.k@gmail.com',NULL,NULL,NULL,NULL,NULL,NULL,'2026-01-01','Active',NULL,NULL,NULL,0,'TELUGU, TELUGU',NULL,NULL,NULL,NULL,'2026-05-31 03:53:47','2026-05-31 03:53:47',NULL,NULL),(13,23,'KASIM SAHEB',NULL,'SIRICHAPALA','1992-12-31','Male',NULL,NULL,'7288822253',NULL,'kasimsaheb.sirichapala@gmail.com',NULL,NULL,NULL,NULL,NULL,NULL,'2025-12-31','Active',NULL,NULL,NULL,0,'HINDI, HINDI',39999.00,NULL,NULL,NULL,'2026-05-31 03:54:51','2026-06-02 18:09:09',NULL,NULL),(14,23,'SIVAREDDY',NULL,'E','1992-12-31','Male',NULL,NULL,'9012345678',NULL,'SIVAREDDYENAKONDA@GMAIL.COM',NULL,NULL,NULL,NULL,NULL,NULL,'2025-12-31','Active',NULL,NULL,NULL,0,'NS, NS',25000.00,NULL,NULL,NULL,'2026-05-31 03:56:16','2026-06-02 18:08:58',NULL,NULL);
 /*!40000 ALTER TABLE `teachers` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -1586,4 +1661,4 @@ UNLOCK TABLES;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 /*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
 
--- Dump completed on 2026-06-02 23:18:37
+-- Dump completed on 2026-06-03  0:13:52
