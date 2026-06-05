@@ -184,6 +184,11 @@ function buildTemporaryPassword(studentId, phoneNumber) {
   return `Parent@${studentId}${suffix}`;
 }
 
+function buildStudentTemporaryPassword(studentId, loginId) {
+  const suffix = String(loginId || '').replace(/\D/g, '').slice(-4) || String(Math.floor(Math.random() * 9000) + 1000);
+  return `Student@${studentId}${suffix}`;
+}
+
 function buildStudentName(payload) {
   return [payload.first_name, payload.middle_name, payload.last_name]
     .filter(Boolean)
@@ -193,6 +198,11 @@ function buildStudentName(payload) {
 function isParentLogin(login) {
   const values = [login.login_type, login.role_name].map((value) => String(value || '').trim().toUpperCase());
   return values.some((value) => ['PARENT', 'GUARDIAN', 'FATHER', 'MOTHER'].includes(value));
+}
+
+function isStudentLogin(login) {
+  const values = [login.login_type, login.role_name].map((value) => String(value || '').trim().toUpperCase());
+  return values.includes('STUDENT');
 }
 
 function getValue(body, camelKey, fallback = null) {
@@ -481,6 +491,16 @@ function buildParentLoginOptions(body, payload) {
   };
 }
 
+function buildStudentLoginOptions(body, payload) {
+  return {
+    createLogin: normalizeBoolean(getValue(body, 'createStudentLogin'), false),
+    loginId: normalizeText(getValue(body, 'studentLoginEmail'))
+      || normalizeText(payload.email)
+      || normalizeText(payload.admission_number),
+    loginPassword: normalizeText(getValue(body, 'studentLoginPassword'))
+  };
+}
+
 function buildStudentUpdatePayload(body) {
   const payload = {};
 
@@ -575,6 +595,28 @@ async function getOrCreateParentRole(connection, clientId) {
   return result.insertId;
 }
 
+async function getOrCreateStudentRole(connection, clientId) {
+  const [roles] = await connection.query(`
+    SELECT id
+    FROM ${rolesTable}
+    WHERE UPPER(role_name) = 'STUDENT'
+      AND (client_id = ? OR client_id IS NULL)
+    ORDER BY CASE WHEN client_id = ? THEN 0 ELSE 1 END
+    LIMIT 1
+  `, [clientId, clientId]);
+
+  if (roles.length) {
+    return roles[0].id;
+  }
+
+  const [result] = await connection.query(
+    `INSERT INTO ${rolesTable} (client_id, role_name, navbar) VALUES (?, 'STUDENT', ?)`,
+    [clientId, JSON.stringify({ navbar: [] })]
+  );
+
+  return result.insertId;
+}
+
 async function linkParentToStudent(connection, clientId, loginId, studentId, relationship) {
   await ensurePortalLinkTables(connection);
 
@@ -614,6 +656,31 @@ async function linkParentToStudent(connection, clientId, loginId, studentId, rel
       parent_login_id: loginId,
       student_id: studentId,
       relationship
+    });
+  }
+}
+
+async function linkStudentLogin(connection, clientId, loginId, studentId) {
+  await ensurePortalLinkTables(connection);
+
+  const [entityLinks] = await connection.query(`
+    SELECT link_id
+    FROM ${userEntityLinksTable}
+    WHERE client_id = ?
+      AND login_id = ?
+      AND entity_type = 'STUDENT'
+      AND entity_id = ?
+    LIMIT 1
+  `, [clientId, loginId, studentId]);
+
+  if (!entityLinks.length) {
+    await connection.query(`INSERT INTO ${userEntityLinksTable} SET ?`, {
+      client_id: clientId,
+      login_id: loginId,
+      entity_type: 'STUDENT',
+      entity_id: studentId,
+      relationship: 'SELF',
+      status: 'ACTIVE'
     });
   }
 }
@@ -686,6 +753,88 @@ async function createParentLogin(connection, payload, studentId, loginOptions) {
     login_email: loginOptions.loginId,
     temporary_password: password,
     role: 'PARENT',
+    existing: false
+  };
+}
+
+async function createStudentLogin(connection, payload, studentId, loginOptions) {
+  if (!loginOptions.createLogin) {
+    return null;
+  }
+
+  if (!loginOptions.loginId) {
+    const error = new Error('Student login email is required');
+    error.code = 'STUDENT_LOGIN_REQUIRED';
+    throw error;
+  }
+
+  const [existingLogins] = await connection.query(`
+    SELECT l.login_id, l.client_id, l.login_type, r.role_name
+    FROM ${loginTable} l
+    LEFT JOIN ${rolesTable} r ON r.id = l.role
+    WHERE l.login_email = ?
+    LIMIT 1
+  `, [loginOptions.loginId]);
+
+  if (existingLogins.length) {
+    const existingLogin = existingLogins[0];
+
+    if (Number(existingLogin.client_id) !== Number(payload.client_id) || !isStudentLogin(existingLogin)) {
+      const error = new Error('A non-student login already exists with this email');
+      error.code = 'STUDENT_LOGIN_EXISTS';
+      throw error;
+    }
+
+    let temporaryPassword = null;
+    if (loginOptions.loginPassword) {
+      const passwordHash = hashPassword(loginOptions.loginPassword);
+      await connection.query(
+        `UPDATE ${loginTable} SET passkey = ?, salt = ?, status = 'ACTIVATED' WHERE login_id = ?`,
+        [passwordHash.passkey, passwordHash.salt, existingLogin.login_id]
+      );
+      temporaryPassword = loginOptions.loginPassword;
+    }
+
+    await linkStudentLogin(connection, payload.client_id, existingLogin.login_id, studentId);
+    return {
+      login_id: existingLogin.login_id,
+      login_email: loginOptions.loginId,
+      temporary_password: temporaryPassword,
+      role: 'STUDENT',
+      existing: true
+    };
+  }
+
+  const password = loginOptions.loginPassword || buildStudentTemporaryPassword(studentId, loginOptions.loginId);
+  const passwordHash = hashPassword(password);
+  const roleId = await getOrCreateStudentRole(connection, payload.client_id);
+  const categoryId = await getClientCategoryId(connection, payload.client_id);
+
+  const loginPayload = {
+    login_email: loginOptions.loginId,
+    passkey: passwordHash.passkey,
+    salt: passwordHash.salt,
+    login_name: buildStudentName(payload) || `Student ${studentId}`,
+    login_designation: 'Student',
+    login_type: 'STUDENT',
+    client_id: payload.client_id,
+    created_by: null,
+    emp_id: null,
+    status: 'ACTIVATED',
+    category: categoryId,
+    role: roleId,
+    password: null,
+    branch_id: null
+  };
+
+  const [loginResult] = await connection.query(`INSERT INTO ${loginTable} SET ?`, loginPayload);
+  await linkStudentLogin(connection, payload.client_id, loginResult.insertId, studentId);
+
+  return {
+    login_id: loginResult.insertId,
+    login_email: loginOptions.loginId,
+    temporary_password: password,
+    role: 'STUDENT',
     existing: false
   };
 }
@@ -817,6 +966,7 @@ function getStudentById(req, res) {
 async function createStudent(req, res) {
   const payload = buildStudentPayload(req.body);
   const parentLoginOptions = buildParentLoginOptions(req.body, payload);
+  const studentLoginOptions = buildStudentLoginOptions(req.body, payload);
 
   if (!payload.first_name || !payload.last_name || !payload.date_of_birth || !payload.gender || !payload.admission_date || !payload.enrollment_status) {
     return res.status(400).json({
@@ -843,15 +993,19 @@ async function createStudent(req, res) {
 
     const [result] = await connection.query(`INSERT INTO ${studentsTable} SET ?`, payload);
     const parentLogin = await createParentLogin(connection, payload, result.insertId, parentLoginOptions);
+    const studentLogin = await createStudentLogin(connection, payload, result.insertId, studentLoginOptions);
 
     await connection.commit();
+    const loginMessage = [parentLogin ? 'parent portal login' : '', studentLogin ? 'student portal login' : ''].filter(Boolean).join(' and ');
     return res.status(201).json({
       success: true,
-      message: parentLogin ? 'Student created successfully with parent portal login' : 'Student created successfully',
+      message: loginMessage ? `Student created successfully with ${loginMessage}` : 'Student created successfully',
       student_id: result.insertId,
       admission_number: payload.admission_number,
       parent_login: parentLogin,
-      parentLogins: parentLogin ? [parentLogin] : []
+      student_login: studentLogin,
+      parentLogins: parentLogin ? [parentLogin] : [],
+      studentLogins: studentLogin ? [studentLogin] : []
     });
   } catch (error) {
     await connection.rollback();
@@ -870,6 +1024,20 @@ async function createStudent(req, res) {
       });
     }
 
+    if (error.code === 'STUDENT_LOGIN_EXISTS') {
+      return res.status(409).json({
+        success: false,
+        message: 'A non-student login already exists with this email. Use another student login email.'
+      });
+    }
+
+    if (error.code === 'STUDENT_LOGIN_REQUIRED') {
+      return res.status(400).json({
+        success: false,
+        message: 'Student login email is required'
+      });
+    }
+
     if (error.code === 'STUDENT_VALIDATION') {
       return res.status(400).json({
         success: false,
@@ -885,6 +1053,7 @@ async function createStudent(req, res) {
 
 async function updateStudent(req, res) {
   const payload = buildStudentUpdatePayload(req.body);
+  const studentLoginRequested = normalizeBoolean(getValue(req.body, 'createStudentLogin'), false);
   delete payload.created_by;
 
   const updates = Object.entries(payload).filter(([, value]) => value !== undefined);
@@ -917,6 +1086,7 @@ async function updateStudent(req, res) {
       ...existingRows[0],
       ...payload
     };
+    const studentLoginOptions = buildStudentLoginOptions(req.body, mergedPayload);
 
     await validateClassAndSection(connection, mergedPayload);
 
@@ -925,11 +1095,16 @@ async function updateStudent(req, res) {
     values.push(req.params.studentId);
 
     await connection.query(`UPDATE ${studentsTable} SET ${columns.join(', ')} WHERE student_id = ?`, values);
+    const studentLogin = studentLoginRequested
+      ? await createStudentLogin(connection, mergedPayload, Number(req.params.studentId), studentLoginOptions)
+      : null;
     await connection.commit();
 
     return res.status(200).json({
       success: true,
-      message: 'Student updated successfully'
+      message: studentLogin ? 'Student updated successfully with student portal login' : 'Student updated successfully',
+      student_login: studentLogin,
+      studentLogins: studentLogin ? [studentLogin] : []
     });
   } catch (error) {
     await connection.rollback();
@@ -938,6 +1113,20 @@ async function updateStudent(req, res) {
       return res.status(400).json({
         success: false,
         message: error.message
+      });
+    }
+
+    if (error.code === 'STUDENT_LOGIN_EXISTS') {
+      return res.status(409).json({
+        success: false,
+        message: 'A non-student login already exists with this email. Use another student login email.'
+      });
+    }
+
+    if (error.code === 'STUDENT_LOGIN_REQUIRED') {
+      return res.status(400).json({
+        success: false,
+        message: 'Student login email is required'
       });
     }
 

@@ -1,6 +1,7 @@
 const { pool } = require('../config');
+const whatsapp = require('./whatsapp');
 
-const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
+const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const sessionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('school_sessions')}`;
 const periodsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('session_periods')}`;
 const schedulesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('class_schedule')}`;
@@ -152,6 +153,53 @@ function normalizeLegacyStudentStatus(value) {
 
 function isLegacySessionAttendance(row) {
   return row.attendanceSession === 'Morning' || row.attendanceSession === 'Afternoon';
+}
+
+async function ensureStudentSessionAttendanceOpen(rows) {
+  const sessionRows = rows.filter((row) => row.attendanceSession !== 'Period');
+  if (!sessionRows.length) {
+    return null;
+  }
+
+  const scheduleIds = [...new Set(sessionRows.map((row) => row.scheduleId))];
+  const schedules = await queryAsync(`
+    SELECT schedule_id, client_id, classroom_id, section_id
+    FROM ${schedulesTable}
+    WHERE schedule_id IN (?)
+  `, [scheduleIds]);
+  const scheduleMap = new Map(schedules.map((schedule) => [Number(schedule.schedule_id), schedule]));
+
+  for (const row of sessionRows) {
+    const schedule = scheduleMap.get(row.scheduleId);
+    if (!schedule) {
+      return 'Schedule not found for student attendance.';
+    }
+
+    const existingRows = await queryAsync(`
+      SELECT sa.student_attendance_id
+      FROM ${studentAttendanceTable} sa
+      INNER JOIN ${schedulesTable} cs ON cs.schedule_id = sa.schedule_id
+      WHERE sa.attendance_date = ?
+        AND sa.attendance_session = ?
+        AND cs.classroom_id = ?
+        AND (cs.section_id <=> ?)
+        AND (? IS NULL OR cs.client_id = ?)
+      LIMIT 1
+    `, [
+      row.attendanceDate,
+      row.attendanceSession,
+      schedule.classroom_id,
+      schedule.section_id,
+      row.clientId || schedule.client_id || null,
+      row.clientId || schedule.client_id || null
+    ]);
+
+    if (existingRows.length) {
+      return `${row.attendanceSession} attendance is already completed for this class on ${row.attendanceDate}.`;
+    }
+  }
+
+  return null;
 }
 
 function getValue(body, key, fallback = undefined) {
@@ -1577,6 +1625,14 @@ async function saveStudentAttendance(req, res) {
 
   try {
     await ensureStudentAttendanceSchema();
+    const sessionAttendanceError = await ensureStudentSessionAttendanceOpen(normalizedRows);
+    if (sessionAttendanceError) {
+      return res.status(409).json({
+        success: false,
+        message: sessionAttendanceError
+      });
+    }
+
     await saveLegacySessionAttendance(normalizedRows);
   } catch (error) {
     return sendDatabaseError(res, error);
@@ -1610,10 +1666,25 @@ async function saveStudentAttendance(req, res) {
 
   try {
     await queryAsync(sql, [values]);
+    let whatsappSummary = null;
+    try {
+      whatsappSummary = await whatsapp.notifyStudentAttendance(normalizedRows);
+    } catch (notificationError) {
+      whatsappSummary = {
+        success: false,
+        sent: 0,
+        skipped: 0,
+        failed: normalizedRows.length,
+        message: notificationError.message
+      };
+    }
 
     return res.status(200).json({
       success: true,
-      message: 'Student attendance saved successfully'
+      message: whatsappSummary?.sent
+        ? `Student attendance saved successfully. ${whatsappSummary.sent} WhatsApp message${whatsappSummary.sent === 1 ? '' : 's'} sent.`
+        : 'Student attendance saved successfully',
+      whatsapp: whatsappSummary
     });
   } catch (error) {
     return sendDatabaseError(res, error);

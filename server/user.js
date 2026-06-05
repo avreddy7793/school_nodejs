@@ -30,6 +30,8 @@ const login = (req, res) => {
                         let login_id = results[0].login_id;
                         let role = results[0].role;
                         let role_name = results[0].role_name;
+                        let login_name = results[0].login_name;
+                        let emp_name = results[0].emp_name;
                         let category = results[0].category;
                         let catgory_id = results[0].category_id
                         let emp_id = results[0].emp_id;
@@ -75,6 +77,8 @@ const login = (req, res) => {
                                 message: 'Welcome to AVR Groups Login successful ',
                                 token: token,
                                 login_email: mockedUsername,
+                                login_name: login_name,
+                                emp_name: emp_name,
                                 login_id: login_id,
                                 role: role,
                                 role_name: role_name,

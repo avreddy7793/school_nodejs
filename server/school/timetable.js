@@ -1,6 +1,6 @@
 const { pool } = require('../config');
 
-const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
+const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const tableCache = new Map();
 const DEFAULT_SESSION_NAME = 'Regular Day';
 const DEFAULT_SESSION_PERIODS = [

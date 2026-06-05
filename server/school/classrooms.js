@@ -1,6 +1,6 @@
 const { pool } = require('../config');
 
-const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
+const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
 
 const selectableColumns = `
@@ -56,44 +56,32 @@ function normalizeString(value) {
   return trimmed || null;
 }
 
-function buildFacilities(body) {
-  const room = normalizeString(getValue(body, 'room'));
-  const notes = normalizeString(getValue(body, 'notes'));
-  const explicitFacilities = normalizeString(getValue(body, 'facilities'));
-
-  if (explicitFacilities) {
-    return explicitFacilities;
-  }
-
-  return [room, notes].filter(Boolean).join(' • ');
-}
-
 function buildClassroomPayload(body) {
   return {
-    client_id: getValue(body, 'clientId'),
-    name: normalizeString(getValue(body, 'name') || getValue(body, 'className')),
+    client_id: getValue(body, 'client_id'),
+    name: normalizeString(getValue(body, 'name')),
     capacity: normalizeCapacity(getValue(body, 'capacity')),
-    facilities: buildFacilities(body)
+    facilities: normalizeString(getValue(body, 'facilities'))
   };
 }
 
 function buildClassroomUpdatePayload(body) {
   const payload = {};
 
-  if (body.name !== undefined || body.className !== undefined) {
-    payload.name = normalizeString(getValue(body, 'name') || getValue(body, 'className'));
+  if (body.name !== undefined) {
+    payload.name = normalizeString(getValue(body, 'name'));
   }
 
   if (body.capacity !== undefined) {
     payload.capacity = normalizeCapacity(body.capacity);
   }
 
-  if (body.facilities !== undefined || body.room !== undefined || body.notes !== undefined) {
-    payload.facilities = buildFacilities(body);
+  if (body.facilities !== undefined) {
+    payload.facilities = normalizeString(body.facilities);
   }
 
-  if (body.clientId !== undefined) {
-    payload.client_id = body.clientId;
+  if (body.client_id !== undefined) {
+    payload.client_id = body.client_id;
   }
 
   return payload;
