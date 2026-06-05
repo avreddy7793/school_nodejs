@@ -1,4 +1,5 @@
 const { pool } = require('../config');
+const holidays = require('./holidays');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const db = pool.promise();
@@ -11,6 +12,7 @@ const userEntityLinksTable = table('user_entity_links');
 const parentStudentLinksTable = table('parent_student_links');
 const examResultsTable = table('exam_results');
 const examsTable = table('exams');
+const onlineExamSettingsTable = table('online_exam_settings');
 const subjectsTable = table('subjects');
 const studentAttendanceTable = table('student_attendance');
 const teacherAttendanceTable = table('teacher_attendance');
@@ -22,6 +24,7 @@ const feeRecordsTable = table('fee_records');
 const transportsTable = table('transports');
 const staffTable = table('staff');
 const teacherLeavesTable = table('teacher_leaves');
+const holidaysTable = table('school_holidays');
 const assignmentsTable = table('student_room_assignments');
 const roomsTable = table('hostel_rooms');
 const hostelPaymentsTable = table('hostel_payments');
@@ -96,6 +99,7 @@ function emptyStudentPortalPayload(clientId) {
     students: [],
     results: [],
     upcomingExams: [],
+    holidays: [],
     attendance: [],
     fees: [],
     transport: [],
@@ -116,6 +120,7 @@ function emptyTeacherPortalPayload(clientId) {
     teacher: null,
     teacherSchedules: [],
     teacherExams: [],
+    holidays: [],
     teacherAttendance: [],
     teacherLeaves: [],
     teacherTotals: {
@@ -344,6 +349,8 @@ async function fetchResults(clientId, studentIds) {
       e.exam_date,
       e.total_marks,
       e.passing_marks,
+      COALESCE(oes.is_online, 0) AS is_online,
+      COALESCE(oes.publish_status, 'DRAFT') AS publish_status,
       er.marks_obtained,
       er.status,
       s.sub_name AS subject_name,
@@ -351,6 +358,7 @@ async function fetchResults(clientId, studentIds) {
       er.created_at
     FROM ${examResultsTable} er
     INNER JOIN ${examsTable} e ON e.exam_id = er.exam_id
+    LEFT JOIN ${onlineExamSettingsTable} oes ON oes.exam_id = e.exam_id
     LEFT JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.classroom_id
     LEFT JOIN ${studentsTable} st ON st.student_id = er.student_id
@@ -377,6 +385,13 @@ async function fetchUpcomingExams(clientId, studentIds) {
       e.total_marks,
       e.passing_marks,
       e.duration,
+      COALESCE(oes.is_online, 0) AS is_online,
+      COALESCE(oes.publish_status, 'DRAFT') AS publish_status,
+      oes.starts_at,
+      oes.ends_at,
+      er.exam_resu_id,
+      er.marks_obtained,
+      er.status AS result_status,
       s.sub_name AS subject_name,
       c.name AS classroom_name
     FROM ${studentsTable} st
@@ -384,6 +399,10 @@ async function fetchUpcomingExams(clientId, studentIds) {
       AND s.client_id = st.client_id
     INNER JOIN ${examsTable} e ON e.subject_id = s.subject_id
       AND e.client_id = st.client_id
+    LEFT JOIN ${onlineExamSettingsTable} oes ON oes.exam_id = e.exam_id
+    LEFT JOIN ${examResultsTable} er ON er.exam_id = e.exam_id
+      AND er.student_id = st.student_id
+      AND er.client_id = st.client_id
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.classroom_id
     WHERE st.client_id = ?
       AND st.student_id IN (?)
@@ -412,11 +431,27 @@ async function fetchAttendance(clientId, studentIds) {
         sa.check_in,
         CONVERT(sa.notes USING utf8mb4) COLLATE utf8mb4_unicode_ci AS notes,
         CONVERT(subj.sub_name USING utf8mb4) COLLATE utf8mb4_unicode_ci AS subject,
-        CAST('PERIOD' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS attendance_type
+        CONVERT(c.name USING utf8mb4) COLLATE utf8mb4_unicode_ci AS classroom_name,
+        CONVERT(sec.section_name USING utf8mb4) COLLATE utf8mb4_unicode_ci AS section_name,
+        CONVERT(TRIM(CONCAT_WS(' ', t.first_name, t.middle_name, t.last_name)) USING utf8mb4) COLLATE utf8mb4_unicode_ci AS teacher_name,
+        CONVERT(sa.attendance_session USING utf8mb4) COLLATE utf8mb4_unicode_ci AS attendance_session,
+        CONVERT(ss.name USING utf8mb4) COLLATE utf8mb4_unicode_ci AS session_name,
+        CONVERT(sp.label USING utf8mb4) COLLATE utf8mb4_unicode_ci AS period_label,
+        sp.start_time,
+        sp.end_time,
+        CASE
+          WHEN sa.attendance_session IN ('Morning', 'Afternoon', 'Session') THEN CAST('SESSION' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci
+          ELSE CAST('PERIOD' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci
+        END AS attendance_type
       FROM ${studentAttendanceTable} sa
       LEFT JOIN ${studentsTable} s ON s.student_id = sa.student_id
       LEFT JOIN ${schedulesTable} cs ON cs.schedule_id = sa.schedule_id
       LEFT JOIN ${subjectsTable} subj ON subj.subject_id = cs.subject_id
+      LEFT JOIN ${classroomsTable} c ON c.classroom_id = cs.classroom_id
+      LEFT JOIN ${sectionsTable} sec ON sec.section_id = cs.section_id
+      LEFT JOIN ${teachersTable} t ON t.teacher_id = cs.teacher_id
+      LEFT JOIN ${sessionsTable} ss ON ss.session_id = cs.session_id
+      LEFT JOIN ${periodsTable} sp ON sp.period_id = cs.period_id
       WHERE cs.client_id = ?
         AND sa.student_id IN (?)
       UNION ALL
@@ -433,6 +468,14 @@ async function fetchAttendance(clientId, studentIds) {
         a.check_in_time_morning AS check_in,
         CONVERT(a.remarks USING utf8mb4) COLLATE utf8mb4_unicode_ci AS notes,
         CAST(NULL AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS subject,
+        CAST(NULL AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS classroom_name,
+        CAST(NULL AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS section_name,
+        CAST(NULL AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS teacher_name,
+        CAST('Day' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS attendance_session,
+        CAST(NULL AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS session_name,
+        CAST(NULL AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS period_label,
+        CAST(NULL AS TIME) AS start_time,
+        CAST(NULL AS TIME) AS end_time,
         CAST('DAY' AS CHAR CHARACTER SET utf8mb4) COLLATE utf8mb4_unicode_ci AS attendance_type
       FROM ${legacyAttendanceTable} a
       LEFT JOIN ${studentsTable} s ON s.student_id = a.student_id
@@ -814,6 +857,80 @@ async function fetchTeacherLeaves(clientId, teacherId) {
   return rows;
 }
 
+async function fetchTeacherHolidays(clientId) {
+  await holidays.ensureTable();
+  const [rows] = await db.query(`
+    SELECT
+      h.holiday_id,
+      h.title,
+      h.description,
+      h.start_date,
+      h.end_date,
+      h.applicable_to,
+      h.status,
+      c.name AS classroom_name
+    FROM ${holidaysTable} h
+    LEFT JOIN ${classroomsTable} c ON c.classroom_id = h.classroom_id
+    WHERE h.client_id = ?
+      AND h.status = 'PUBLISHED'
+      AND h.applicable_to IN ('ALL', 'TEACHERS')
+      AND h.end_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+    ORDER BY h.start_date ASC, h.holiday_id DESC
+    LIMIT 50
+  `, [clientId]);
+
+  return rows;
+}
+
+async function fetchStudentHolidays(clientId, studentIds) {
+  if (!studentIds.length) {
+    return [];
+  }
+
+  await holidays.ensureTable();
+  const [classRows] = await db.query(`
+    SELECT DISTINCT class_name AS classroom_id
+    FROM ${studentsTable}
+    WHERE client_id = ?
+      AND student_id IN (?)
+      AND class_name IS NOT NULL
+  `, [clientId, studentIds]);
+
+  const classroomIds = classRows
+    .map((row) => normalizePositiveInteger(row.classroom_id))
+    .filter(Boolean);
+
+  const values = [clientId];
+  let classClause = 'h.classroom_id IS NULL';
+  if (classroomIds.length) {
+    classClause = '(h.classroom_id IS NULL OR h.classroom_id IN (?))';
+    values.push(classroomIds);
+  }
+
+  const [rows] = await db.query(`
+    SELECT
+      h.holiday_id,
+      h.title,
+      h.description,
+      h.start_date,
+      h.end_date,
+      h.applicable_to,
+      h.status,
+      c.name AS classroom_name
+    FROM ${holidaysTable} h
+    LEFT JOIN ${classroomsTable} c ON c.classroom_id = h.classroom_id
+    WHERE h.client_id = ?
+      AND h.status = 'PUBLISHED'
+      AND h.applicable_to IN ('ALL', 'STUDENTS')
+      AND ${classClause}
+      AND h.end_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+    ORDER BY h.start_date ASC, h.holiday_id DESC
+    LIMIT 50
+  `, values);
+
+  return rows;
+}
+
 function summarizeAttendance(attendance) {
   return attendance.reduce((summary, record) => {
     const key = String(record.status || '').toLowerCase();
@@ -864,12 +981,13 @@ async function buildTeacherPortalPayload(req) {
     return emptyTeacherPortalPayload(scope.clientId);
   }
 
-  const [teacher, teacherSchedules, teacherExams, teacherAttendance, teacherLeaves] = await Promise.all([
+  const [teacher, teacherSchedules, teacherExams, teacherAttendance, teacherLeaves, portalHolidays] = await Promise.all([
     fetchTeacher(scope.clientId, scope.teacherId),
     fetchTeacherSchedules(scope.clientId, scope.teacherId),
     fetchTeacherExams(scope.clientId, scope.teacherId),
     fetchTeacherAttendance(scope.clientId, scope.teacherId),
-    fetchTeacherLeaves(scope.clientId, scope.teacherId)
+    fetchTeacherLeaves(scope.clientId, scope.teacherId),
+    fetchTeacherHolidays(scope.clientId)
   ]);
 
   return {
@@ -877,6 +995,7 @@ async function buildTeacherPortalPayload(req) {
     teacher,
     teacherSchedules,
     teacherExams,
+    holidays: portalHolidays,
     teacherAttendance,
     teacherLeaves,
     teacherTotals: {
@@ -912,10 +1031,11 @@ async function buildPortalPayload(req, requestedStudentId = null) {
     return emptyStudentPortalPayload(scope.clientId);
   }
 
-  const [students, results, upcomingExams, attendance, fees, transport, hostel] = await Promise.all([
+  const [students, results, upcomingExams, holidaysRows, attendance, fees, transport, hostel] = await Promise.all([
     fetchStudents(scope.clientId, studentIds),
     fetchResults(scope.clientId, studentIds),
     fetchUpcomingExams(scope.clientId, studentIds),
+    fetchStudentHolidays(scope.clientId, studentIds),
     fetchAttendance(scope.clientId, studentIds),
     fetchFees(scope.clientId, studentIds),
     fetchTransport(scope.clientId, studentIds),
@@ -928,6 +1048,7 @@ async function buildPortalPayload(req, requestedStudentId = null) {
     students,
     results,
     upcomingExams,
+    holidays: holidaysRows,
     attendance,
     fees,
     transport,

@@ -8,6 +8,7 @@ const classroomsRouter = require("./school/classrooms.router");
 const classroomSessionsRouter = require("./school/classroom-sessions.router");
 const scheduleRouter = require("./school/schedule.router");
 const examsRouter = require("./school/exams.router");
+const onlineExamsRouter = require("./school/online-exams.router");
 const subjectsRouter = require("./school/subjects.router");
 const feesRouter = require("./school/fees.router");
 const staffRouter = require("./school/staff.router");
@@ -19,6 +20,9 @@ const timetableRouter = require("./school/timetable.router");
 const settingsRouter = require("./school/settings.router");
 const salaryRouter = require("./school/salary.router");
 const syllabusRouter = require("./school/syllabus.router");
+const holidaysRouter = require("./school/holidays.router");
+const paymentsRouter = require("./school/payments.router");
+const whatsappRouter = require("./school/whatsapp.router");
 
 const multer = require('multer');
 const storage = multer.diskStorage({
@@ -59,6 +63,8 @@ module.exports = function (app) {
   app.use("/api/subjects", subjectsRouter);
   app.use("/api/school/exams", examsRouter);
   app.use("/api/exams", examsRouter);
+  app.use("/api/school/online-exams", onlineExamsRouter);
+  app.use("/api/online-exams", onlineExamsRouter);
   app.use("/api/school/fees", feesRouter);
   app.use("/api/fees", feesRouter);
   app.use("/api/school/staff", staffRouter);
@@ -73,6 +79,12 @@ module.exports = function (app) {
   app.use("/api/portal", db.checkToken, portalRouter);
   app.use("/api/school/settings", settingsRouter);
   app.use("/api/settings", settingsRouter);
+  app.use("/api/school/holidays", holidaysRouter);
+  app.use("/api/holidays", holidaysRouter);
+  app.use("/api/school/payments", paymentsRouter);
+  app.use("/api/payments", paymentsRouter);
+  app.use("/api/school/whatsapp", whatsappRouter);
+  app.use("/api/whatsapp", whatsappRouter);
   app.use("/api/school/salaries", salaryRouter);
   app.use("/api/salaries", salaryRouter);
   app.use("/api/school/syllabus", syllabusRouter);
