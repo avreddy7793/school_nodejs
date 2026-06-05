@@ -88,10 +88,23 @@ async function ensureSettingsSchema() {
       created_at timestamp NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (setting_id),
-      UNIQUE KEY uq_school_settings_client (client_id),
+      UNIQUE KEY uq_school_settings_client_year (client_id, current_academic_year),
       KEY idx_school_settings_year (current_academic_year)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
+
+  const [oldClientIndex] = await pool.promise().query(`SHOW INDEX FROM ${schoolSettingsTable} WHERE Key_name = 'uq_school_settings_client'`);
+  if (oldClientIndex.length) {
+    await pool.promise().query(`ALTER TABLE ${schoolSettingsTable} DROP INDEX uq_school_settings_client`);
+  }
+
+  const [clientYearIndex] = await pool.promise().query(`SHOW INDEX FROM ${schoolSettingsTable} WHERE Key_name = 'uq_school_settings_client_year'`);
+  if (!clientYearIndex.length) {
+    await pool.promise().query(`
+      ALTER TABLE ${schoolSettingsTable}
+      ADD UNIQUE KEY uq_school_settings_client_year (client_id, current_academic_year)
+    `);
+  }
 }
 
 function mapBranding(row) {
@@ -216,7 +229,19 @@ async function getAcademicCalendar(req, res) {
     });
   }
 
-  pool.query(`SELECT * FROM ${schoolSettingsTable} WHERE client_id = ? LIMIT 1`, [clientId], (error, rows) => {
+  pool.query(`
+    SELECT *
+    FROM ${schoolSettingsTable}
+    WHERE client_id = ?
+    ORDER BY
+      CASE
+        WHEN academic_year_start_date <= CURDATE() AND academic_year_end_date >= CURDATE() THEN 0
+        ELSE 1
+      END,
+      academic_year_start_date DESC,
+      updated_at DESC
+    LIMIT 1
+  `, [clientId], (error, rows) => {
     if (error) {
       return sendDatabaseError(res, error);
     }
@@ -274,7 +299,6 @@ async function updateAcademicCalendar(req, res) {
       (client_id, current_academic_year, academic_year_start_date, academic_year_end_date)
     VALUES (?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
-      current_academic_year = VALUES(current_academic_year),
       academic_year_start_date = VALUES(academic_year_start_date),
       academic_year_end_date = VALUES(academic_year_end_date)
   `, [clientId, payload.current_academic_year, payload.academic_year_start_date, payload.academic_year_end_date], (error) => {

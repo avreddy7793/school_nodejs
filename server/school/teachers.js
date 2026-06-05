@@ -13,6 +13,7 @@ const userEntityLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdenti
 const loginTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('login')}`;
 const rolesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('roles')}`;
 const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
+const defaultPortalPassword = 'password';
 
 const selectableColumns = `
   teacher_id,
@@ -472,7 +473,7 @@ async function createTeacherLogin(connection, payload, teacherId, loginOptions) 
 
   await ensureUserEntityLinksTable(connection);
 
-  const password = loginOptions.loginPassword || buildTemporaryPassword(teacherId, payload.phone_number);
+  const password = loginOptions.loginPassword || defaultPortalPassword;
   const passwordHash = hashPassword(password);
   const roleId = await getOrCreateTeacherRole(connection, payload.client_id);
   const categoryId = await getClientCategoryId(connection, payload.client_id);
@@ -490,7 +491,7 @@ async function createTeacherLogin(connection, payload, teacherId, loginOptions) 
     status: 'ACTIVATED',
     category: categoryId,
     role: roleId,
-    password: null,
+    password,
     branch_id: loginOptions.branchId || null
   };
 

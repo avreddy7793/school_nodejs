@@ -10,6 +10,7 @@ const parentStudentLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIde
 const loginTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('login')}`;
 const rolesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('roles')}`;
 const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
+const defaultPortalPassword = 'password';
 
 const selectableColumns = `
   s.student_id,
@@ -789,8 +790,8 @@ async function createStudentLogin(connection, payload, studentId, loginOptions) 
     if (loginOptions.loginPassword) {
       const passwordHash = hashPassword(loginOptions.loginPassword);
       await connection.query(
-        `UPDATE ${loginTable} SET passkey = ?, salt = ?, status = 'ACTIVATED' WHERE login_id = ?`,
-        [passwordHash.passkey, passwordHash.salt, existingLogin.login_id]
+        `UPDATE ${loginTable} SET passkey = ?, salt = ?, password = ?, status = 'ACTIVATED' WHERE login_id = ?`,
+        [passwordHash.passkey, passwordHash.salt, loginOptions.loginPassword, existingLogin.login_id]
       );
       temporaryPassword = loginOptions.loginPassword;
     }
@@ -805,7 +806,7 @@ async function createStudentLogin(connection, payload, studentId, loginOptions) 
     };
   }
 
-  const password = loginOptions.loginPassword || buildStudentTemporaryPassword(studentId, loginOptions.loginId);
+  const password = loginOptions.loginPassword || defaultPortalPassword;
   const passwordHash = hashPassword(password);
   const roleId = await getOrCreateStudentRole(connection, payload.client_id);
   const categoryId = await getClientCategoryId(connection, payload.client_id);
@@ -823,7 +824,7 @@ async function createStudentLogin(connection, payload, studentId, loginOptions) 
     status: 'ACTIVATED',
     category: categoryId,
     role: roleId,
-    password: null,
+    password,
     branch_id: null
   };
 

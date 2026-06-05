@@ -7,6 +7,7 @@ const db = pool.promise();
 const examsTable = table('exams');
 const subjectsTable = table('subjects');
 const classroomsTable = table('classrooms');
+const schedulesTable = table('class_schedule');
 const studentsTable = table('students');
 const resultsTable = table('exam_results');
 const settingsTable = table('online_exam_settings');
@@ -91,6 +92,98 @@ function getValue(body, camelKey, snakeKey = camelKey, fallback = undefined) {
   return fallback;
 }
 
+function normalizeRoleValue(value) {
+  return String(value || '').trim().toUpperCase().replace(/[_-]+/g, ' ');
+}
+
+function isAdminDecoded(decoded = {}) {
+  const roleCandidates = [
+    decoded.role,
+    decoded.role_name,
+    decoded.login_type,
+    decoded.category,
+    decoded.entity_type
+  ].map(normalizeRoleValue);
+
+  return roleCandidates.some((role) => [
+    'SUPER ADMIN',
+    'SCHOOL ADMIN',
+    'ADMIN',
+    'ADMINISTRATOR',
+    'MASTER',
+    'OWNER',
+    'PRINCIPAL',
+    'MANAGER',
+    'BRANCH MANAGER'
+  ].includes(role)) || ['1', '2', '3', '4', '5'].includes(String(decoded.role || ''));
+}
+
+function isTeacherDecoded(decoded = {}) {
+  return [
+    decoded.role,
+    decoded.role_name,
+    decoded.login_type,
+    decoded.category,
+    decoded.entity_type
+  ].map(normalizeRoleValue).includes('TEACHER');
+}
+
+function decodedTeacherId(decoded = {}) {
+  if (!isTeacherDecoded(decoded)) {
+    return null;
+  }
+
+  return normalizePositiveInteger(decoded.teacher_id)
+    || (normalizeRoleValue(decoded.entity_type) === 'TEACHER' ? normalizePositiveInteger(decoded.entity_id) : null);
+}
+
+function decodedClientId(req) {
+  return normalizePositiveInteger(req.decoded?.client_id || req.query.client_id || req.body?.client_id || req.body?.clientId);
+}
+
+function forbidden(res, message = 'You do not have permission to manage this online exam.') {
+  return res.status(403).json({ success: false, message });
+}
+
+async function canManageExam(req, examId) {
+  const decoded = req.decoded || {};
+  if (isAdminDecoded(decoded)) {
+    return true;
+  }
+
+  const teacherId = decodedTeacherId(decoded);
+  const clientId = decodedClientId(req);
+  if (!teacherId || !clientId || !examId) {
+    return false;
+  }
+
+  const [rows] = await db.query(`
+    SELECT e.exam_id
+    FROM ${examsTable} e
+    INNER JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
+    INNER JOIN ${schedulesTable} cs ON cs.classroom_id = s.classroom_id
+      AND cs.subject_id = e.subject_id
+      AND cs.client_id = e.client_id
+      AND cs.teacher_id = ?
+      AND (cs.status IS NULL OR cs.status = 'Active')
+    WHERE e.exam_id = ?
+      AND e.client_id = ?
+    LIMIT 1
+  `, [teacherId, examId, clientId]);
+
+  return rows.length > 0;
+}
+
+async function requireExamManager(req, res, examId) {
+  const allowed = await canManageExam(req, examId);
+  if (!allowed) {
+    forbidden(res);
+    return false;
+  }
+
+  return true;
+}
+
 function extractResponseText(payload) {
   if (typeof payload?.output_text === 'string') {
     return payload.output_text;
@@ -171,7 +264,20 @@ async function ensureSchema() {
     return;
   }
 
+  await ensureColumn(settingsTable, 'question_paper_name', 'VARCHAR(255) DEFAULT NULL');
+  await ensureColumn(settingsTable, 'question_paper_mime', 'VARCHAR(120) DEFAULT NULL');
+  await ensureColumn(settingsTable, 'question_paper_data', 'LONGTEXT DEFAULT NULL');
+  await ensureColumn(settingsTable, 'question_paper_uploaded_at', 'TIMESTAMP NULL DEFAULT NULL');
   schemaReady = true;
+}
+
+async function ensureColumn(tableName, columnName, definition) {
+  const [columns] = await db.query(`SHOW COLUMNS FROM ${tableName} LIKE ?`, [columnName]);
+  if (columns.length) {
+    return;
+  }
+
+  await db.query(`ALTER TABLE ${tableName} ADD COLUMN ${escapeIdentifier(columnName)} ${definition}`);
 }
 
 function examSelectSql() {
@@ -192,17 +298,25 @@ function examSelectSql() {
       oes.online_exam_id,
       COALESCE(oes.publish_status, 'DRAFT') AS publish_status,
       COALESCE(oes.is_online, 0) AS is_online,
-      oes.starts_at,
-      oes.ends_at,
+      DATE_FORMAT(oes.starts_at, '%Y-%m-%dT%H:%i') AS starts_at,
+      DATE_FORMAT(oes.ends_at, '%Y-%m-%dT%H:%i') AS ends_at,
       oes.instructions,
+      oes.question_paper_name,
+      oes.question_paper_mime,
+      oes.question_paper_data,
+      oes.question_paper_uploaded_at,
       COUNT(DISTINCT q.question_id) AS question_count,
-      COUNT(DISTINCT a.attempt_id) AS attempt_count
+      COUNT(DISTINCT a.attempt_id) AS attempt_count,
+      COUNT(DISTINCT st.student_id) AS total_student_count
     FROM ${examsTable} e
     LEFT JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.classroom_id
     LEFT JOIN ${settingsTable} oes ON oes.exam_id = e.exam_id
     LEFT JOIN ${questionsTable} q ON q.exam_id = e.exam_id AND q.status = 'ACTIVE'
     LEFT JOIN ${attemptsTable} a ON a.exam_id = e.exam_id AND a.status IN ('SUBMITTED', 'EVALUATED')
+    LEFT JOIN ${studentsTable} st ON st.client_id = e.client_id
+      AND st.class_name = s.classroom_id
+      AND (st.enrollment_status IS NULL OR st.enrollment_status = 'Active')
   `;
 }
 
@@ -211,6 +325,8 @@ async function listOnlineExams(req, res) {
     await ensureSchema();
     const conditions = [];
     const values = [];
+    const teacherId = decodedTeacherId(req.decoded || {});
+    const isAdmin = isAdminDecoded(req.decoded || {});
 
     if (req.query.client_id) {
       conditions.push('e.client_id = ?');
@@ -227,6 +343,21 @@ async function listOnlineExams(req, res) {
       conditions.push("(e.exam_status IS NULL OR e.exam_status = 'OPEN')");
     }
 
+    if (teacherId && !isAdmin) {
+      conditions.push(`EXISTS (
+        SELECT 1
+        FROM ${schedulesTable} scope_cs
+        WHERE scope_cs.classroom_id = s.classroom_id
+          AND scope_cs.subject_id = e.subject_id
+          AND scope_cs.client_id = e.client_id
+          AND scope_cs.teacher_id = ?
+          AND (scope_cs.status IS NULL OR scope_cs.status = 'Active')
+      )`);
+      values.push(teacherId);
+    } else if (!isAdmin) {
+      return forbidden(res);
+    }
+
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const [rows] = await db.query(`
       ${examSelectSql()}
@@ -235,7 +366,10 @@ async function listOnlineExams(req, res) {
       ORDER BY e.exam_date DESC, e.exam_id DESC
     `, values);
 
-    return res.status(200).json({ success: true, data: rows });
+    return res.status(200).json({
+      success: true,
+      data: rows.map((row) => ({ ...row, question_paper_data: undefined }))
+    });
   } catch (error) {
     return sendDatabaseError(res, error);
   }
@@ -247,6 +381,10 @@ async function getQuestions(req, res) {
     const examId = normalizePositiveInteger(req.params.examId);
     if (!examId) {
       return res.status(400).json({ success: false, message: 'Exam id is required' });
+    }
+
+    if (!await requireExamManager(req, res, examId)) {
+      return;
     }
 
     const [rows] = await db.query(`
@@ -271,6 +409,10 @@ async function saveQuestions(req, res) {
 
     if (!examId || !clientId || !questions.length) {
       return res.status(400).json({ success: false, message: 'Client, exam, and questions are required' });
+    }
+
+    if (!await requireExamManager(req, res, examId)) {
+      return;
     }
 
     await db.query(`DELETE FROM ${questionsTable} WHERE exam_id = ?`, [examId]);
@@ -320,6 +462,10 @@ async function generateQuestions(req, res) {
 
     if (!examId || !clientId) {
       return res.status(400).json({ success: false, message: 'Client and exam are required for AI question generation' });
+    }
+
+    if (!await requireExamManager(req, res, examId)) {
+      return;
     }
 
     const [examRows] = await db.query(`
@@ -433,6 +579,10 @@ async function updateSettings(req, res) {
       return res.status(400).json({ success: false, message: 'Client and exam are required' });
     }
 
+    if (!await requireExamManager(req, res, examId)) {
+      return;
+    }
+
     const payload = {
       client_id: clientId,
       exam_id: examId,
@@ -466,6 +616,100 @@ async function updateSettings(req, res) {
         ? `Online exam finished successfully. ${finalizedCount} student result${finalizedCount === 1 ? '' : 's'} published.`
         : 'Online exam settings saved successfully'
     });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+}
+
+async function uploadQuestionPaper(req, res) {
+  try {
+    await ensureSchema();
+    const examId = normalizePositiveInteger(req.params.examId);
+    const clientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id);
+    const fileName = normalizeString(req.body.fileName || req.body.file_name);
+    const mimeType = normalizeString(req.body.mimeType || req.body.mime_type);
+    const fileData = normalizeString(req.body.fileData || req.body.file_data);
+
+    if (!examId || !clientId) {
+      return res.status(400).json({ success: false, message: 'Client and exam are required' });
+    }
+
+    if (!await requireExamManager(req, res, examId)) {
+      return;
+    }
+
+    if (!fileName || !mimeType || !fileData) {
+      return res.status(400).json({ success: false, message: 'Question paper file is required' });
+    }
+
+    const allowedTypes = new Set([
+      'application/pdf',
+      'image/png',
+      'image/jpeg',
+      'image/webp',
+      'application/msword',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ]);
+
+    if (!allowedTypes.has(mimeType)) {
+      return res.status(400).json({ success: false, message: 'Upload PDF, image, DOC, or DOCX question papers only.' });
+    }
+
+    if (Buffer.byteLength(fileData, 'utf8') > 7 * 1024 * 1024) {
+      return res.status(400).json({ success: false, message: 'Question paper must be 5 MB or smaller.' });
+    }
+
+    await db.query(`
+      INSERT INTO ${settingsTable}
+        (client_id, exam_id, is_online, publish_status, question_paper_name, question_paper_mime, question_paper_data, question_paper_uploaded_at)
+      VALUES (?, ?, 1, 'DRAFT', ?, ?, ?, NOW())
+      ON DUPLICATE KEY UPDATE
+        is_online = 1,
+        question_paper_name = VALUES(question_paper_name),
+        question_paper_mime = VALUES(question_paper_mime),
+        question_paper_data = VALUES(question_paper_data),
+        question_paper_uploaded_at = NOW(),
+        updated_at = CURRENT_TIMESTAMP
+    `, [clientId, examId, fileName, mimeType, fileData]);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Question paper uploaded successfully',
+      data: {
+        question_paper_name: fileName,
+        question_paper_mime: mimeType,
+        question_paper_uploaded_at: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+}
+
+async function getQuestionPaper(req, res) {
+  try {
+    await ensureSchema();
+    const examId = normalizePositiveInteger(req.params.examId);
+    if (!examId) {
+      return res.status(400).json({ success: false, message: 'Exam id is required' });
+    }
+
+    if (!await requireExamManager(req, res, examId)) {
+      return;
+    }
+
+    const [rows] = await db.query(`
+      SELECT question_paper_name, question_paper_mime, question_paper_data, question_paper_uploaded_at
+      FROM ${settingsTable}
+      WHERE exam_id = ?
+      LIMIT 1
+    `, [examId]);
+
+    if (!rows.length || !rows[0].question_paper_data) {
+      return res.status(404).json({ success: false, message: 'No question paper uploaded for this exam.' });
+    }
+
+    return res.status(200).json({ success: true, data: rows[0] });
   } catch (error) {
     return sendDatabaseError(res, error);
   }
@@ -549,6 +793,7 @@ async function getAvailableExams(req, res) {
       success: true,
       data: rows.map((row) => ({
         ...row,
+        question_paper_data: undefined,
         attempt_status: row.attempt_id ? row.status : null
       }))
     });
@@ -761,6 +1006,10 @@ async function getSummary(req, res) {
       return res.status(400).json({ success: false, message: 'Exam id is required' });
     }
 
+    if (!await requireExamManager(req, res, examId)) {
+      return;
+    }
+
     const [rows] = await db.query(`
       SELECT
         a.attempt_id,
@@ -872,6 +1121,8 @@ module.exports = {
   saveQuestions,
   generateQuestions,
   updateSettings,
+  uploadQuestionPaper,
+  getQuestionPaper,
   getAvailableExams,
   getAttempt,
   submitAttempt,

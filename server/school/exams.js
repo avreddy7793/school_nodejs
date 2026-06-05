@@ -10,7 +10,7 @@ const schedulesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('
 const teachersTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teachers')}`;
 const syllabusUnitsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('syllabus_units')}`;
 const syllabusPlansTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('syllabus_plans')}`;
-const examTypes = ['Unit Test 1', 'Unit Test 2', 'Half Yearly', 'Unit Test 3', 'Unit Test 4', 'Pre Final', 'Final Exam', 'Other'];
+const examTypes = ['Unit Test 1', 'Unit Test 2', 'Half Yearly', 'Unit Test 3', 'Unit Test 4', 'Pre Final', 'Final Exam', 'Online', 'Other'];
 let examWorkflowSchemaReady = false;
 
 const selectableColumns = `
@@ -100,10 +100,25 @@ function ensureExamWorkflowSchema(callback) {
         return;
       }
 
-      examWorkflowSchemaReady = true;
-      callback();
+      ensureExamTypeColumn((typeError) => {
+        if (typeError) {
+          callback(typeError);
+          return;
+        }
+
+        examWorkflowSchemaReady = true;
+        callback();
+      });
     });
   });
+}
+
+function ensureExamTypeColumn(callback) {
+  const enumValues = examTypes.map((type) => `'${type.replace(/'/g, "''")}'`).join(',');
+  pool.query(`
+    ALTER TABLE ${examsTable}
+    MODIFY exam_type ENUM(${enumValues}) NOT NULL DEFAULT 'Other'
+  `, callback);
 }
 
 function ensureColumn(tableName, columnName, definition, callback) {

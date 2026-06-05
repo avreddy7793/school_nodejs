@@ -23,6 +23,7 @@ const syllabusRouter = require("./school/syllabus.router");
 const holidaysRouter = require("./school/holidays.router");
 const paymentsRouter = require("./school/payments.router");
 const whatsappRouter = require("./school/whatsapp.router");
+const reportsRouter = require("./school/reports.router");
 
 const multer = require('multer');
 const storage = multer.diskStorage({
@@ -85,6 +86,8 @@ module.exports = function (app) {
   app.use("/api/payments", paymentsRouter);
   app.use("/api/school/whatsapp", whatsappRouter);
   app.use("/api/whatsapp", whatsappRouter);
+  app.use("/api/school/reports", reportsRouter);
+  app.use("/api/reports", reportsRouter);
   app.use("/api/school/salaries", salaryRouter);
   app.use("/api/salaries", salaryRouter);
   app.use("/api/school/syllabus", syllabusRouter);
