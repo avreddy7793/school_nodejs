@@ -382,6 +382,7 @@ async function fetchUpcomingExams(clientId, studentIds) {
       CONCAT_WS(' ', st.first_name, st.middle_name, st.last_name) AS student_name,
       e.exam_id,
       e.exam_date,
+      e.session_name,
       e.total_marks,
       e.passing_marks,
       e.duration,
@@ -393,20 +394,27 @@ async function fetchUpcomingExams(clientId, studentIds) {
       er.marks_obtained,
       er.status AS result_status,
       s.sub_name AS subject_name,
-      c.name AS classroom_name
+      c.name AS classroom_name,
+      sec.section_name
     FROM ${studentsTable} st
     INNER JOIN ${subjectsTable} s ON s.classroom_id = st.class_name
       AND s.client_id = st.client_id
     INNER JOIN ${examsTable} e ON e.subject_id = s.subject_id
       AND e.client_id = st.client_id
+      AND (e.classroom_id IS NULL OR e.classroom_id = st.class_name)
     LEFT JOIN ${onlineExamSettingsTable} oes ON oes.exam_id = e.exam_id
     LEFT JOIN ${examResultsTable} er ON er.exam_id = e.exam_id
       AND er.student_id = st.student_id
       AND er.client_id = st.client_id
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.classroom_id
+    LEFT JOIN ${sectionsTable} sec ON sec.section_id = e.section_id
     WHERE st.client_id = ?
       AND st.student_id IN (?)
       AND e.exam_date >= CURDATE()
+      AND (
+        e.section_id IS NULL
+        OR UPPER(TRIM(sec.section_name)) = UPPER(TRIM(st.section))
+      )
     ORDER BY e.exam_date ASC, e.exam_id ASC
     LIMIT 30
   `, [clientId, studentIds]);

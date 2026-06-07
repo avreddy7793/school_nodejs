@@ -4,6 +4,7 @@ const fees = require('./fees');
 const router = express.Router();
 
 router.get('/', fees.getFeeRecords);
+router.get('/payments', fees.getAllFeePayments);
 router.get('/:feeId/payments', fees.getFeePayments);
 router.get('/:feeId', fees.getFeeRecordById);
 router.post('/', fees.createFeeRecord);

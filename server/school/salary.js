@@ -10,6 +10,27 @@ const staffTable = table('staff');
 const teacherAttendanceTable = table('teacher_attendance');
 const staffAttendanceTable = table('staff_attendance');
 const PAYROLL_DAYS_PER_MONTH = 30;
+const ADMIN_PAYROLL_ROLES = new Set(['SUPER_ADMIN', 'SCHOOL_ADMIN']);
+const ROLE_ID_ALIASES = {
+  '1': 'SCHOOL_ADMIN',
+  '2': 'SCHOOL_ADMIN',
+  '3': 'SCHOOL_ADMIN',
+  '4': 'SCHOOL_ADMIN',
+  '5': 'SCHOOL_ADMIN'
+};
+const ROLE_NAME_ALIASES = {
+  ADMIN: 'SCHOOL_ADMIN',
+  ADMINISTRATOR: 'SCHOOL_ADMIN',
+  MASTER: 'SCHOOL_ADMIN',
+  OWNER: 'SCHOOL_ADMIN',
+  MANAGER: 'SCHOOL_ADMIN',
+  'BRANCH MANAGER': 'SCHOOL_ADMIN',
+  'SCHOOL ADMIN': 'SCHOOL_ADMIN',
+  SCHOOL_ADMIN: 'SCHOOL_ADMIN',
+  SUPER: 'SUPER_ADMIN',
+  'SUPER ADMIN': 'SUPER_ADMIN',
+  SUPER_ADMIN: 'SUPER_ADMIN'
+};
 
 function escapeIdentifier(value) {
   return `\`${String(value).replace(/`/g, '``')}\``;
@@ -50,6 +71,61 @@ function normalizeText(value, fallback = null) {
   return trimmed || fallback;
 }
 
+function normalizeRoleValue(value) {
+  const rawRole = normalizeText(value);
+  if (!rawRole) {
+    return null;
+  }
+
+  const roleIdAlias = ROLE_ID_ALIASES[rawRole];
+  if (roleIdAlias) {
+    return roleIdAlias;
+  }
+
+  const normalizedRole = rawRole.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').toUpperCase();
+  return ROLE_NAME_ALIASES[normalizedRole] || ROLE_NAME_ALIASES[normalizedRole.replace(/\s+/g, '_')] || null;
+}
+
+function isPayrollAdminRequest(req) {
+  const decoded = req.decoded || req.user || {};
+  const body = req.body || {};
+  const query = req.query || {};
+  const decodedRoleCandidates = [
+    decoded.role,
+    decoded.roleName,
+    decoded.role_name,
+    decoded.loginType,
+    decoded.login_type,
+    decoded.category,
+    decoded.entityType,
+    decoded.entity_type
+  ];
+  const hasDecodedRole = decodedRoleCandidates.some((value) => Boolean(normalizeText(value)));
+  const decodedRoles = decodedRoleCandidates.map(normalizeRoleValue).filter(Boolean);
+
+  if (hasDecodedRole) {
+    return decodedRoles.some((role) => ADMIN_PAYROLL_ROLES.has(role));
+  }
+
+  const roleCandidates = [
+    body.role,
+    body.roleName,
+    body.role_name,
+    body.loginType,
+    body.login_type,
+    body.category,
+    body.entityType,
+    body.entity_type,
+    query.role,
+    query.roleName,
+    query.role_name,
+    query.loginType,
+    query.login_type
+  ];
+
+  return roleCandidates.map(normalizeRoleValue).some((role) => ADMIN_PAYROLL_ROLES.has(role));
+}
+
 function monthBounds(year, month) {
   const lastDay = new Date(year, month, 0).getDate();
   const paddedMonth = String(month).padStart(2, '0');
@@ -58,6 +134,40 @@ function monthBounds(year, month) {
     start: `${year}-${paddedMonth}-01`,
     end: `${year}-${paddedMonth}-${String(lastDay).padStart(2, '0')}`,
     days: lastDay
+  };
+}
+
+function localDateKey(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, '0'),
+    String(date.getDate()).padStart(2, '0')
+  ].join('-');
+}
+
+function formatDateLabel(date) {
+  const monthLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${date.getDate()} ${monthLabels[date.getMonth()]} ${date.getFullYear()}`;
+}
+
+function payrollGenerationWindow(year, month, referenceDate = new Date()) {
+  const monthEnd = new Date(year, month, 0);
+  const lastWorkingDay = new Date(monthEnd);
+
+  while (lastWorkingDay.getDay() === 0 || lastWorkingDay.getDay() === 6) {
+    lastWorkingDay.setDate(lastWorkingDay.getDate() - 1);
+  }
+
+  const allowedDates = [lastWorkingDay, monthEnd].filter((date, index, dates) => {
+    const key = localDateKey(date);
+    return dates.findIndex((item) => localDateKey(item) === key) === index;
+  });
+  const todayKey = localDateKey(referenceDate);
+
+  return {
+    isCurrentMonth: referenceDate.getFullYear() === year && referenceDate.getMonth() + 1 === month,
+    isAllowedToday: allowedDates.some((date) => localDateKey(date) === todayKey),
+    allowedDateText: allowedDates.map(formatDateLabel).join(' or ')
   };
 }
 
@@ -283,6 +393,28 @@ async function generatePayrollRun(req, res) {
     return res.status(400).json({
       success: false,
       message: 'client_id, payroll_month, and payroll_year are required'
+    });
+  }
+
+  if (!isPayrollAdminRequest(req)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Only admin can generate payroll.'
+    });
+  }
+
+  const generationWindow = payrollGenerationWindow(year, month);
+  if (!generationWindow.isCurrentMonth) {
+    return res.status(400).json({
+      success: false,
+      message: 'Payroll can be generated only for the running month.'
+    });
+  }
+
+  if (!generationWindow.isAllowedToday) {
+    return res.status(400).json({
+      success: false,
+      message: `Payroll can be generated on ${generationWindow.allowedDateText} only.`
     });
   }
 
