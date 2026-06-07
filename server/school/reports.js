@@ -11,6 +11,12 @@ const examResultsTable = table('exam_results');
 const subjectsTable = table('subjects');
 const studentAttendanceTable = table('student_attendance');
 const clientMasterTable = table('client_master');
+const feeRecordsTable = table('fee_records');
+const feePaymentsTable = table('fee_payments');
+const hostelAssignmentsTable = table('student_room_assignments');
+const hostelRoomsTable = table('hostel_rooms');
+const hostelPaymentsTable = table('hostel_payments');
+const transportsTable = table('transports');
 
 function table(name) {
   return `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier(name)}`;
@@ -49,6 +55,18 @@ function normalizeDate(value) {
 
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : String(value).slice(0, 10);
+}
+
+function feeCategoryExpression(category) {
+  const normalized = String(category || 'ALL').trim().toUpperCase();
+  const expressions = {
+    SCHOOL: 'COALESCE(fr.monthly_fee, 0) + COALESCE(fr.registration_fee, 0) + COALESCE(fr.art_material, 0) + COALESCE(fr.books, 0) + COALESCE(fr.uniform, 0) + COALESCE(fr.fine, 0) + COALESCE(fr.others, 0) + COALESCE(fr.previous_balance, 0)',
+    ADMISSION: 'COALESCE(fr.admission_fee, 0)',
+    TRANSPORT: 'COALESCE(fr.transport, 0)',
+    ALL: 'COALESCE(fr.total, 0)'
+  };
+
+  return expressions[normalized] || expressions.ALL;
 }
 
 function currentAcademicYear(today = new Date()) {
@@ -528,7 +546,227 @@ async function sendProgressCardsWhatsapp(req, res) {
   }
 }
 
+async function getOperationalReports(req, res) {
+  try {
+    const clientId = normalizePositiveInteger(req.query.client_id || req.decoded?.client_id);
+    const classroomId = normalizePositiveInteger(req.query.classroom_id || req.query.class_id);
+    const examId = normalizePositiveInteger(req.query.exam_id);
+    const feeCategory = normalizeText(req.query.fee_category, 'ALL');
+    const dateFrom = normalizeDate(req.query.date_from);
+    const dateTo = normalizeDate(req.query.date_to);
+    const academicYear = normalizeText(req.query.academic_year, currentAcademicYear());
+
+    if (!clientId) {
+      return res.status(400).json({ success: false, message: 'Client id is required' });
+    }
+
+    const feeScope = feeCategoryExpression(feeCategory);
+    const feePaymentConditions = ['fp.client_id = ?'];
+    const feePaymentValues = [clientId];
+    if (classroomId) {
+      feePaymentConditions.push('fr.classroom_id = ?');
+      feePaymentValues.push(classroomId);
+    }
+    if (dateFrom) {
+      feePaymentConditions.push('fp.payment_date >= ?');
+      feePaymentValues.push(dateFrom);
+    }
+    if (dateTo) {
+      feePaymentConditions.push('fp.payment_date <= ?');
+      feePaymentValues.push(dateTo);
+    }
+
+    const feeRecordConditions = ['fr.client_id = ?'];
+    const feeRecordValues = [clientId];
+    if (classroomId) {
+      feeRecordConditions.push('fr.classroom_id = ?');
+      feeRecordValues.push(classroomId);
+    }
+    if (academicYear) {
+      feeRecordConditions.push('(fr.fee_year = ? OR fr.fee_year = ? OR fr.fee_year IS NULL OR fr.fee_year = \'\')');
+      feeRecordValues.push(academicYear, academicYear.split('-')[0]);
+    }
+
+    const [dayWiseFees] = await db.query(`
+      SELECT
+        fp.payment_date,
+        COUNT(DISTINCT fp.payment_id) AS receipt_count,
+        SUM(fp.amount) AS collected_amount,
+        SUM(CASE WHEN fr.due_balance > 0 THEN 1 ELSE 0 END) AS pending_records
+      FROM ${feePaymentsTable} fp
+      INNER JOIN ${feeRecordsTable} fr ON fr.fee_id = fp.fee_id
+      WHERE ${feePaymentConditions.join(' AND ')}
+      GROUP BY fp.payment_date
+      ORDER BY fp.payment_date DESC
+    `, feePaymentValues);
+
+    const [pendingFees] = await db.query(`
+      SELECT
+        fr.fee_id,
+        fr.fee_reg_no,
+        fr.student_id,
+        CONCAT_WS(' ', s.first_name, s.middle_name, s.last_name) AS student_name,
+        s.admission_number,
+        c.name AS classroom_name,
+        fr.fee_year,
+        ${feeScope} AS category_total,
+        COALESCE(fr.deposit, 0) AS paid_amount,
+        CASE
+          WHEN ? = 'ALL' THEN COALESCE(fr.due_balance, 0)
+          ELSE GREATEST(${feeScope} - COALESCE(fr.deposit, 0), 0)
+        END AS due_amount
+      FROM ${feeRecordsTable} fr
+      INNER JOIN ${studentsTable} s ON s.student_id = fr.student_id
+      LEFT JOIN ${classroomsTable} c ON c.classroom_id = fr.classroom_id
+      WHERE ${feeRecordConditions.join(' AND ')}
+      HAVING due_amount > 0
+      ORDER BY c.name ASC, s.first_name ASC
+    `, [String(feeCategory || 'ALL').toUpperCase(), ...feeRecordValues]);
+
+    const hostelConditions = ['sra.client_id = ?'];
+    const hostelValues = [clientId];
+    if (classroomId) {
+      hostelConditions.push('s.class_name = ?');
+      hostelValues.push(classroomId);
+    }
+
+    const hostelPaymentDateConditions = [];
+    const hostelPaymentValues = [];
+    if (dateFrom) {
+      hostelPaymentDateConditions.push('hp.payment_date >= ?');
+      hostelPaymentValues.push(dateFrom);
+    }
+    if (dateTo) {
+      hostelPaymentDateConditions.push('hp.payment_date <= ?');
+      hostelPaymentValues.push(dateTo);
+    }
+
+    const [hostelClassWise] = await db.query(`
+      SELECT
+        c.classroom_id,
+        c.name AS classroom_name,
+        COUNT(DISTINCT sra.assignment_id) AS assigned_students,
+        SUM(COALESCE(hr.fee, 0)) AS hostel_fee_total,
+        COALESCE(SUM(hp.amount), 0) AS collected_amount,
+        GREATEST(SUM(COALESCE(hr.fee, 0)) - COALESCE(SUM(hp.amount), 0), 0) AS due_amount
+      FROM ${hostelAssignmentsTable} sra
+      INNER JOIN ${studentsTable} s ON s.student_id = sra.student_id
+      LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.class_name
+      INNER JOIN ${hostelRoomsTable} hr ON hr.room_id = sra.room_id
+      LEFT JOIN ${hostelPaymentsTable} hp ON hp.assignment_id = sra.assignment_id
+        ${hostelPaymentDateConditions.length ? `AND ${hostelPaymentDateConditions.join(' AND ')}` : ''}
+      WHERE ${hostelConditions.join(' AND ')}
+      GROUP BY c.classroom_id, c.name
+      ORDER BY c.name ASC
+    `, [...hostelPaymentValues, ...hostelValues]);
+
+    const transportConditions = ['s.client_id = ?'];
+    const transportValues = [clientId];
+    if (classroomId) {
+      transportConditions.push('s.class_name = ?');
+      transportValues.push(classroomId);
+    }
+
+    const [transportWise] = await db.query(`
+      SELECT
+        t.transport_id,
+        t.vehicleNumber AS vehicle_number,
+        t.route,
+        t.capacity,
+        t.departureTime AS departure_time,
+        COUNT(s.student_id) AS student_count,
+        GROUP_CONCAT(CONCAT_WS(' ', s.first_name, s.middle_name, s.last_name) ORDER BY s.first_name SEPARATOR ', ') AS students
+      FROM ${transportsTable} t
+      LEFT JOIN ${studentsTable} s ON s.transport_id = t.transport_id
+        AND ${transportConditions.join(' AND ')}
+      WHERE t.client_id = ?
+      GROUP BY t.transport_id, t.vehicleNumber, t.route, t.capacity, t.departureTime
+      ORDER BY t.route ASC, t.vehicleNumber ASC
+    `, [...transportValues, clientId]);
+
+    const hallTicketConditions = ['s.client_id = ?'];
+    const hallTicketValues = [clientId];
+    if (classroomId) {
+      hallTicketConditions.push('s.class_name = ?');
+      hallTicketValues.push(classroomId);
+    }
+
+    const examConditions = ['e.client_id = ?'];
+    const examValues = [clientId];
+    if (examId) {
+      examConditions.push('e.exam_id = ?');
+      examValues.push(examId);
+    }
+    if (academicYear) {
+      examConditions.push('(e.academic_year = ? OR e.academic_year IS NULL OR e.academic_year = \'\')');
+      examValues.push(academicYear);
+    }
+    if (dateFrom) {
+      examConditions.push('e.exam_date >= ?');
+      examValues.push(dateFrom);
+    }
+    if (dateTo) {
+      examConditions.push('e.exam_date <= ?');
+      examValues.push(dateTo);
+    }
+
+    const [hallTickets] = await db.query(`
+      SELECT
+        s.student_id,
+        s.admission_number,
+        CONCAT_WS(' ', s.first_name, s.middle_name, s.last_name) AS student_name,
+        s.roll_number,
+        c.name AS classroom_name,
+        s.section,
+        e.exam_id,
+        e.exam_type,
+        e.exam_date,
+        e.duration,
+        sub.sub_name AS subject_name
+      FROM ${studentsTable} s
+      INNER JOIN ${classroomsTable} c ON c.classroom_id = s.class_name
+      INNER JOIN ${subjectsTable} sub ON sub.classroom_id = c.classroom_id
+      INNER JOIN ${examsTable} e ON e.subject_id = sub.subject_id
+        AND ${examConditions.join(' AND ')}
+      WHERE ${hallTicketConditions.join(' AND ')}
+      ORDER BY c.name ASC, s.section ASC, s.roll_number ASC, e.exam_date ASC, sub.sub_name ASC
+    `, [...examValues, ...hallTicketValues]);
+
+    const feeSummary = {
+      collected: dayWiseFees.reduce((sum, row) => sum + Number(row.collected_amount || 0), 0),
+      pending: pendingFees.reduce((sum, row) => sum + Number(row.due_amount || 0), 0),
+      pending_students: pendingFees.length
+    };
+    const hostelSummary = {
+      collected: hostelClassWise.reduce((sum, row) => sum + Number(row.collected_amount || 0), 0),
+      pending: hostelClassWise.reduce((sum, row) => sum + Number(row.due_amount || 0), 0),
+      assigned_students: hostelClassWise.reduce((sum, row) => sum + Number(row.assigned_students || 0), 0)
+    };
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        filters: { client_id: clientId, classroom_id: classroomId, exam_id: examId, fee_category: feeCategory, academic_year: academicYear, date_from: dateFrom, date_to: dateTo },
+        summary: {
+          fee: feeSummary,
+          hostel: hostelSummary,
+          transport_students: transportWise.reduce((sum, row) => sum + Number(row.student_count || 0), 0),
+          hall_tickets: hallTickets.length
+        },
+        dayWiseFees,
+        pendingFees,
+        hostelClassWise,
+        transportWise,
+        hallTickets
+      }
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+}
+
 module.exports = {
   getProgressCards,
-  sendProgressCardsWhatsapp
+  sendProgressCardsWhatsapp,
+  getOperationalReports
 };

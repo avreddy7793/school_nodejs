@@ -5,6 +5,7 @@ const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
 const sectionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('sections')}`;
+const transportsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('transports')}`;
 const userEntityLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('user_entity_links')}`;
 const parentStudentLinksTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('parent_student_links')}`;
 const loginTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('login')}`;
@@ -387,6 +388,39 @@ async function validateClassAndSection(connection, payload) {
   }
 }
 
+async function validateTransportAssignment(connection, payload) {
+  if (payload.transport_id === undefined || payload.transport_id === null || payload.transport_id === '') {
+    payload.transport_id = null;
+    return;
+  }
+
+  const transportId = normalizePositiveInteger(payload.transport_id);
+  if (!transportId) {
+    const error = new Error('Selected transport route is invalid.');
+    error.code = 'STUDENT_VALIDATION';
+    throw error;
+  }
+
+  const [routes] = await connection.query(
+    `
+      SELECT transport_id
+      FROM ${transportsTable}
+      WHERE transport_id = ?
+        AND (? IS NULL OR client_id = ?)
+      LIMIT 1
+    `,
+    [transportId, payload.client_id || null, payload.client_id || null]
+  );
+
+  if (!routes.length) {
+    const error = new Error('Selected transport route does not exist for this client.');
+    error.code = 'STUDENT_VALIDATION';
+    throw error;
+  }
+
+  payload.transport_id = transportId;
+}
+
 async function generateStudentAdmissionIdentity(connection, payload) {
   const classroomId = normalizePositiveInteger(payload.class_name);
   const academicYear = normalizeText(payload.academic_year) || currentAcademicYear();
@@ -480,13 +514,8 @@ async function countStudentReferences(connection, studentId) {
 
 function buildParentLoginOptions(body, payload) {
   return {
-    createLogin: normalizeBoolean(getValue(body, 'createParentLogin'), true),
-    loginId: normalizeText(getValue(body, 'parentLoginId'))
-      || normalizeText(payload.guardian_contact)
-      || normalizeText(payload.father_contact)
-      || normalizeText(payload.mother_contact)
-      || normalizeText(payload.email)
-      || normalizeText(payload.phone_number),
+    createLogin: normalizeBoolean(getValue(body, 'createParentLogin'), false),
+    loginId: normalizeText(getValue(body, 'parentLoginId')),
     loginPassword: normalizeText(getValue(body, 'parentLoginPassword')),
     relationship: normalizeText(payload.guardian_relation) || 'PARENT'
   };
@@ -982,6 +1011,7 @@ async function createStudent(req, res) {
     await connection.beginTransaction();
 
     await validateClassAndSection(connection, payload);
+    await validateTransportAssignment(connection, payload);
 
     if (!payload.academic_year) {
       payload.academic_year = currentAcademicYear();
@@ -1090,9 +1120,13 @@ async function updateStudent(req, res) {
     const studentLoginOptions = buildStudentLoginOptions(req.body, mergedPayload);
 
     await validateClassAndSection(connection, mergedPayload);
+    await validateTransportAssignment(connection, mergedPayload);
+    if (payload.transport_id !== undefined) {
+      payload.transport_id = mergedPayload.transport_id;
+    }
 
     const columns = updates.map(([key]) => `${key} = ?`);
-    const values = updates.map(([, value]) => value);
+    const values = updates.map(([key]) => payload[key]);
     values.push(req.params.studentId);
 
     await connection.query(`UPDATE ${studentsTable} SET ${columns.join(', ')} WHERE student_id = ?`, values);

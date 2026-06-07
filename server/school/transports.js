@@ -1,8 +1,9 @@
 const { pool } = require('../config');
 
-const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
+const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const transportsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('transports')}`;
 const staffTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('staff')}`;
+let transportSchemaReady = null;
 
 const selectableColumns = `
   t.transport_id,
@@ -12,6 +13,7 @@ const selectableColumns = `
   CONCAT_WS(' ', s.firstName, s.lastName) AS driver_name,
   s.employee_id AS driver_employee_id,
   t.route,
+  t.transport_charge,
   t.capacity,
   t.departureTime,
   t.status
@@ -27,6 +29,42 @@ function sendDatabaseError(res, error) {
     message: 'Database error',
     error: error.message
   });
+}
+
+async function ensureTransportSchema() {
+  if (!transportSchemaReady) {
+    transportSchemaReady = (async () => {
+      const [columns] = await pool.promise().query(
+        `
+          SELECT COLUMN_NAME
+          FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = ?
+            AND TABLE_NAME = 'transports'
+            AND COLUMN_NAME = 'transport_charge'
+          LIMIT 1
+        `,
+        [schoolDatabase]
+      );
+
+      if (!columns.length) {
+        await pool.promise().query(`
+          ALTER TABLE ${transportsTable}
+          ADD COLUMN transport_charge DECIMAL(10,2) DEFAULT 0 AFTER route
+        `);
+      }
+    })().catch((error) => {
+      transportSchemaReady = null;
+      throw error;
+    });
+  }
+
+  return transportSchemaReady;
+}
+
+function runWithTransportSchema(res, callback) {
+  ensureTransportSchema()
+    .then(callback)
+    .catch((error) => sendDatabaseError(res, error));
 }
 
 function getValue(body, camelKey, snakeKey = camelKey, fallback = undefined) {
@@ -64,6 +102,15 @@ function normalizeNonNegativeInteger(value) {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
+function normalizeMoney(value, fallback = 0) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Number(parsed.toFixed(2)) : null;
+}
+
 function normalizeStatus(value) {
   const normalized = String(value || 'Active').trim().toLowerCase();
   return normalized === 'inactive' ? 'Inactive' : 'Active';
@@ -75,6 +122,7 @@ function buildTransportPayload(body) {
     vehicleNumber: normalizeText(getValue(body, 'vehicleNumber', 'vehicle_number')),
     driverName: normalizePositiveInteger(getValue(body, 'driverName', 'driver_name')),
     route: normalizeText(getValue(body, 'route')),
+    transport_charge: normalizeMoney(getValue(body, 'transportCharge', 'transport_charge'), 0),
     capacity: normalizeNonNegativeInteger(getValue(body, 'capacity')),
     departureTime: normalizeText(getValue(body, 'departureTime', 'departure_time')),
     status: normalizeStatus(getValue(body, 'status'))
@@ -88,6 +136,7 @@ function buildTransportUpdatePayload(body) {
     vehicleNumber: 'vehicleNumber',
     driverName: 'driverName',
     route: 'route',
+    transportCharge: 'transport_charge',
     capacity: 'capacity',
     departureTime: 'departureTime',
     status: 'status'
@@ -107,6 +156,11 @@ function buildTransportUpdatePayload(body) {
 
     if (column === 'capacity') {
       payload[column] = normalizeNonNegativeInteger(rawValue);
+      return;
+    }
+
+    if (column === 'transport_charge') {
+      payload[column] = normalizeMoney(rawValue, 0);
       return;
     }
 
@@ -156,14 +210,16 @@ function getTransports(req, res) {
     ORDER BY t.transport_id DESC
   `;
 
-  pool.query(sql, values, (error, results) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  runWithTransportSchema(res, () => {
+    pool.query(sql, values, (error, results) => {
+      if (error) {
+        return sendDatabaseError(res, error);
+      }
 
-    return res.status(200).json({
-      success: true,
-      data: results
+      return res.status(200).json({
+        success: true,
+        data: results
+      });
     });
   });
 }
@@ -177,21 +233,23 @@ function getTransportById(req, res) {
     WHERE t.transport_id = ? AND (? IS NULL OR t.client_id = ?)
   `;
 
-  pool.query(sql, [req.params.transportId, clientId || null, clientId || null], (error, results) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  runWithTransportSchema(res, () => {
+    pool.query(sql, [req.params.transportId, clientId || null, clientId || null], (error, results) => {
+      if (error) {
+        return sendDatabaseError(res, error);
+      }
 
-    if (!results.length) {
-      return res.status(404).json({
-        success: false,
-        message: 'Transport not found'
+      if (!results.length) {
+        return res.status(404).json({
+          success: false,
+          message: 'Transport not found'
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        data: results[0]
       });
-    }
-
-    return res.status(200).json({
-      success: true,
-      data: results[0]
     });
   });
 }
@@ -206,15 +264,24 @@ function createTransport(req, res) {
     });
   }
 
-  pool.query(`INSERT INTO ${transportsTable} SET ?`, payload, (error, result) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  if (payload.transport_charge === null) {
+    return res.status(400).json({
+      success: false,
+      message: 'Transport charge must be a valid non-negative number'
+    });
+  }
 
-    return res.status(201).json({
-      success: true,
-      message: 'Transport saved successfully',
-      transport_id: result.insertId
+  runWithTransportSchema(res, () => {
+    pool.query(`INSERT INTO ${transportsTable} SET ?`, payload, (error, result) => {
+      if (error) {
+        return sendDatabaseError(res, error);
+      }
+
+      return res.status(201).json({
+        success: true,
+        message: 'Transport saved successfully',
+        transport_id: result.insertId
+      });
     });
   });
 }
@@ -229,28 +296,30 @@ function updateTransport(req, res) {
     });
   }
 
-  if (payload.client_id === null || payload.vehicleNumber === null || payload.capacity === null) {
+  if (payload.client_id === null || payload.vehicleNumber === null || payload.capacity === null || payload.transport_charge === null) {
     return res.status(400).json({
       success: false,
       message: 'Update values must be valid'
     });
   }
 
-  pool.query(`UPDATE ${transportsTable} SET ? WHERE transport_id = ?`, [payload, req.params.transportId], (error, result) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  runWithTransportSchema(res, () => {
+    pool.query(`UPDATE ${transportsTable} SET ? WHERE transport_id = ?`, [payload, req.params.transportId], (error, result) => {
+      if (error) {
+        return sendDatabaseError(res, error);
+      }
 
-    if (!result.affectedRows) {
-      return res.status(404).json({
-        success: false,
-        message: 'Transport not found'
+      if (!result.affectedRows) {
+        return res.status(404).json({
+          success: false,
+          message: 'Transport not found'
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: 'Transport updated successfully'
       });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: 'Transport updated successfully'
     });
   });
 }

@@ -1,6 +1,6 @@
 const { pool } = require('../config');
 
-const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
+const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const feesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('fee_records')}`;
 const feePaymentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('fee_payments')}`;
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
@@ -361,6 +361,79 @@ function getFeeRecordById(req, res) {
   });
 }
 
+async function getAllFeePayments(req, res) {
+  try {
+    await ensureFeePaymentSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
+  const { client_id, payment_date, date_from, date_to } = req.query;
+  const conditions = [];
+  const values = [];
+
+  if (client_id) {
+    conditions.push('(fp.client_id = ? OR fr.client_id = ?)');
+    values.push(client_id, client_id);
+  }
+
+  if (payment_date) {
+    conditions.push('fp.payment_date = ?');
+    values.push(payment_date);
+  }
+
+  if (date_from) {
+    conditions.push('fp.payment_date >= ?');
+    values.push(date_from);
+  }
+
+  if (date_to) {
+    conditions.push('fp.payment_date <= ?');
+    values.push(date_to);
+  }
+
+  const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const sql = `
+    SELECT
+      fp.payment_id,
+      fp.client_id,
+      fp.fee_id,
+      fr.fee_reg_no,
+      fr.student_id,
+      CONCAT_WS(' ', s.first_name, s.middle_name, s.last_name) AS student_name,
+      s.admission_number,
+      fr.classroom_id,
+      c.name AS classroom_name,
+      fr.fee_year,
+      fp.receipt_no,
+      fp.payment_date,
+      fp.payment_type,
+      fp.payment_mode,
+      fp.amount,
+      fp.total_paid_after,
+      fp.due_balance_after,
+      fp.notes,
+      fp.created_at
+    FROM ${feePaymentsTable} fp
+    INNER JOIN ${feesTable} fr ON fr.fee_id = fp.fee_id
+    INNER JOIN ${studentsTable} s ON s.student_id = fr.student_id
+    INNER JOIN ${classroomsTable} c ON c.classroom_id = fr.classroom_id
+    ${whereClause}
+    ORDER BY fp.payment_date DESC, fp.payment_id DESC
+  `;
+
+  pool.query(sql, values, (error, results) => {
+    if (error) {
+      return sendDatabaseError(res, error);
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: results
+    });
+  });
+}
+
 async function createFeeRecord(req, res) {
   try {
     await ensureFeePaymentSchema();
@@ -602,6 +675,7 @@ function deleteFeeRecord(req, res) {
 module.exports = {
   getFeeRecords,
   getFeeRecordById,
+  getAllFeePayments,
   getFeePayments,
   createFeeRecord,
   updateFeeRecord,
