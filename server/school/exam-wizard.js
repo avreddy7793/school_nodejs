@@ -14,7 +14,7 @@ const studentsTable = table('students');
 const teacherSubjectAssignmentsTable = table('teacher_subject_assignments');
 const clientMasterTable = table('client_master');
 
-const EXAM_TYPES = ['Unit Test 1', 'Unit Test 2', 'Half Yearly', 'Unit Test 3', 'Unit Test 4', 'Pre Final', 'Final Exam', 'Online', 'Other'];
+const EXAM_TYPES = ['Month Test', 'Unit Test 1', 'Unit Test 2', 'Half Yearly', 'Unit Test 3', 'Unit Test 4', 'Pre Final', 'Final Exam', 'Online', 'Other'];
 const ADMIN_ROLE_NAMES = new Set(['SUPER ADMIN', 'SCHOOL ADMIN', 'ADMIN', 'ADMINISTRATOR', 'MASTER', 'OWNER', 'PRINCIPAL', 'MANAGER', 'BRANCH MANAGER']);
 const ADMIN_ROLE_IDS = new Set(['1', '2', '3', '4', '5']);
 
@@ -415,6 +415,80 @@ async function getDashboard(req, res) {
   }
 }
 
+async function loadReadyReportProgress(connection, clientId, examGroupIds = []) {
+  const groupIds = [...new Set((examGroupIds || []).map(Number).filter(Boolean))];
+  const values = [clientId];
+  let groupFilter = '';
+  if (groupIds.length) {
+    groupFilter = 'AND e.exam_group_id IN (?)';
+    values.push(groupIds);
+  }
+
+  const [rows] = await connection.query(`
+    SELECT
+      e.exam_group_id,
+      e.classroom_id,
+      c.name AS classroom_name,
+      e.section_id,
+      sec.section_name,
+      COUNT(DISTINCT CONCAT(e.exam_id, ':', st.student_id)) AS expected_result_count,
+      COUNT(DISTINCT CONCAT(er.exam_id, ':', er.student_id)) AS entered_result_count
+    FROM ${examsTable} e
+    LEFT JOIN ${classroomsTable} c ON c.classroom_id = e.classroom_id
+    LEFT JOIN ${sectionsTable} sec ON sec.section_id = e.section_id
+    INNER JOIN ${studentsTable} st
+      ON st.client_id = e.client_id
+      AND st.class_name = e.classroom_id
+      AND st.enrollment_status = 'Active'
+      AND (
+        e.section_id IS NULL
+        OR UPPER(TRIM(st.section)) = UPPER(TRIM(sec.section_name))
+      )
+    LEFT JOIN ${examResultsTable} er
+      ON er.client_id = e.client_id
+      AND er.exam_id = e.exam_id
+      AND er.student_id = st.student_id
+    WHERE e.client_id = ?
+      AND e.exam_group_id IS NOT NULL
+      ${groupFilter}
+    GROUP BY e.exam_group_id, e.classroom_id, c.name, e.section_id, sec.section_name
+  `, values);
+
+  return rows;
+}
+
+function buildReadyReportMaps(classProgressRows) {
+  const readyClassroomMap = new Map();
+  const readyClassReportMap = new Map();
+
+  classProgressRows.forEach((row) => {
+    const groupId = Number(row.exam_group_id);
+    const classroomId = Number(row.classroom_id);
+    const expected = Number(row.expected_result_count || 0);
+    const entered = Number(row.entered_result_count || 0);
+    if (expected > 0 && entered >= expected) {
+      const classroomList = readyClassroomMap.get(groupId) || [];
+      if (!classroomList.includes(classroomId)) {
+        classroomList.push(classroomId);
+      }
+      readyClassroomMap.set(groupId, classroomList);
+
+      const reportList = readyClassReportMap.get(groupId) || [];
+      reportList.push({
+        classroom_id: classroomId,
+        classroom_name: row.classroom_name || null,
+        section_id: row.section_id || null,
+        section_name: row.section_name || null,
+        expected_result_count: expected,
+        entered_result_count: entered
+      });
+      readyClassReportMap.set(groupId, reportList);
+    }
+  });
+
+  return { readyClassroomMap, readyClassReportMap };
+}
+
 async function getExamGroups(req, res) {
   const clientId = clientIdFrom(req);
   if (!clientId) {
@@ -422,25 +496,95 @@ async function getExamGroups(req, res) {
   }
 
   try {
-    const [groups] = await pool.promise().query(`
-      SELECT
-        eg.*,
-        MIN(e.exam_type) AS exam_type,
-        COUNT(DISTINCT egc.id) AS assignment_count,
-        COUNT(DISTINCT e.exam_id) AS timetable_count,
-        COUNT(DISTINCT ht.hall_ticket_id) AS hall_ticket_count,
-        COUNT(DISTINCT er.exam_resu_id) AS result_count
-      FROM ${examGroupsTable} eg
-      LEFT JOIN ${examGroupClassesTable} egc ON egc.exam_group_id = eg.exam_group_id AND egc.client_id = eg.client_id
-      LEFT JOIN ${examsTable} e ON e.exam_group_id = eg.exam_group_id AND e.client_id = eg.client_id
-      LEFT JOIN ${examHallTicketsTable} ht ON ht.exam_group_id = eg.exam_group_id AND ht.client_id = eg.client_id AND ht.status = 'GENERATED'
-      LEFT JOIN ${examResultsTable} er ON er.exam_id = e.exam_id AND er.client_id = eg.client_id
-      WHERE eg.client_id = ?
-      GROUP BY eg.exam_group_id
-      ORDER BY eg.created_at DESC
-    `, [clientId]);
+    const database = pool.promise();
+    const [
+      [groups],
+      [assignmentCounts],
+      [timetableCounts],
+      [ticketCounts],
+      [resultCounts],
+      [expectedCounts],
+      classProgressRows
+    ] = await Promise.all([
+      database.query(`
+        SELECT *
+        FROM ${examGroupsTable}
+        WHERE client_id = ?
+        ORDER BY created_at DESC
+      `, [clientId]),
+      database.query(`
+        SELECT exam_group_id, COUNT(*) AS assignment_count
+        FROM ${examGroupClassesTable}
+        WHERE client_id = ?
+        GROUP BY exam_group_id
+      `, [clientId]),
+      database.query(`
+        SELECT exam_group_id, MIN(exam_type) AS exam_type, COUNT(*) AS timetable_count
+        FROM ${examsTable}
+        WHERE client_id = ? AND exam_group_id IS NOT NULL
+        GROUP BY exam_group_id
+      `, [clientId]),
+      database.query(`
+        SELECT exam_group_id, COUNT(*) AS hall_ticket_count
+        FROM ${examHallTicketsTable}
+        WHERE client_id = ? AND status = 'GENERATED'
+        GROUP BY exam_group_id
+      `, [clientId]),
+      database.query(`
+        SELECT
+          e.exam_group_id,
+          COUNT(DISTINCT er.exam_resu_id) AS result_count,
+          COUNT(DISTINCT CONCAT(er.exam_id, ':', er.student_id)) AS entered_result_count
+        FROM ${examResultsTable} er
+        INNER JOIN ${examsTable} e ON e.exam_id = er.exam_id AND e.client_id = er.client_id
+        WHERE er.client_id = ? AND e.exam_group_id IS NOT NULL
+        GROUP BY e.exam_group_id
+      `, [clientId]),
+      database.query(`
+        SELECT
+          e.exam_group_id,
+          COUNT(*) AS expected_result_count
+        FROM ${examsTable} e
+        INNER JOIN ${studentsTable} st
+          ON st.client_id = e.client_id
+          AND st.class_name = e.classroom_id
+          AND st.enrollment_status = 'Active'
+        LEFT JOIN ${sectionsTable} sec ON sec.section_id = e.section_id
+        WHERE e.client_id = ?
+          AND e.exam_group_id IS NOT NULL
+          AND (
+            e.section_id IS NULL
+            OR UPPER(TRIM(st.section)) = UPPER(TRIM(sec.section_name))
+          )
+        GROUP BY e.exam_group_id
+      `, [clientId]),
+      loadReadyReportProgress(database, clientId)
+    ]);
 
-    return res.status(200).json({ success: true, data: groups.map(mapExamGroupRow) });
+    const countMaps = [assignmentCounts, timetableCounts, ticketCounts, resultCounts, expectedCounts].map((rows) => new Map(
+      rows.map((row) => [Number(row.exam_group_id), row])
+    ));
+    const { readyClassroomMap, readyClassReportMap } = buildReadyReportMaps(classProgressRows);
+    const mergedGroups = groups.map((group) => {
+      const groupId = Number(group.exam_group_id);
+      const readyClassroomIds = readyClassroomMap.get(groupId) || [];
+      const readyClassReports = readyClassReportMap.get(groupId) || [];
+      return {
+        ...group,
+        exam_type: countMaps[1].get(groupId)?.exam_type || group.exam_type,
+        assignment_count: Number(countMaps[0].get(groupId)?.assignment_count || 0),
+        timetable_count: Number(countMaps[1].get(groupId)?.timetable_count || 0),
+        hall_ticket_count: Number(countMaps[2].get(groupId)?.hall_ticket_count || 0),
+        result_count: Number(countMaps[3].get(groupId)?.result_count || 0),
+        entered_result_count: Number(countMaps[3].get(groupId)?.entered_result_count || 0),
+        expected_result_count: Number(countMaps[4].get(groupId)?.expected_result_count || 0),
+        class_report_ready_count: readyClassReports.length,
+        ready_classroom_ids: readyClassroomIds,
+        ready_class_reports: readyClassReports
+      };
+    });
+
+    return res.status(200).json({ success: true, data: mergedGroups.map(mapExamGroupRow) });
   } catch (error) {
     return sendDatabaseError(res, error);
   }
@@ -1040,7 +1184,24 @@ async function loadTimetable(connection, examGroupId, clientId, filters = {}) {
       e.*,
       c.name AS classroom_name,
       sec.section_name,
-      s.sub_name AS subject_name
+      s.sub_name AS subject_name,
+      (
+        SELECT COUNT(*)
+        FROM ${studentsTable} st
+        WHERE st.client_id = e.client_id
+          AND st.class_name = e.classroom_id
+          AND st.enrollment_status = 'Active'
+          AND (
+            e.section_id IS NULL
+            OR UPPER(TRIM(st.section)) = UPPER(TRIM(sec.section_name))
+          )
+      ) AS expected_result_count,
+      (
+        SELECT COUNT(DISTINCT er.student_id)
+        FROM ${examResultsTable} er
+        WHERE er.client_id = e.client_id
+          AND er.exam_id = e.exam_id
+      ) AS entered_result_count
     FROM ${examsTable} e
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = e.classroom_id
     LEFT JOIN ${sectionsTable} sec ON sec.section_id = e.section_id
@@ -1133,6 +1294,7 @@ async function loadHallTicketStudents(connection, examGroupId, clientId, filters
       st.admission_number,
       CONCAT_WS(' ', st.first_name, st.middle_name, st.last_name) AS student_name,
       st.roll_number,
+      st.father_name,
       st.class_name AS classroom_id,
       c.name AS classroom_name,
       st.section AS student_section,
@@ -1177,6 +1339,7 @@ function mapHallTicket(group, school, student, timetable, savedTicket = {}) {
       student_id: student.student_id,
       admission_number: student.admission_number,
       student_name: student.student_name,
+      father_name: student.father_name,
       roll_number: student.roll_number,
       classroom_id: student.classroom_id,
       classroom_name: student.classroom_name,
@@ -1482,7 +1645,10 @@ async function getMarksEntry(req, res) {
 
     const database = pool.promise();
     const exams = await loadMarksEntryExams(database, context.clientId, context.examGroupId, req);
-    const selectedExam = exams[0] || null;
+    const requestedExamId = normalizeOptionalPositiveInteger(getValue(req.query, 'examId', 'exam_id') || getValue(req.body, 'examId', 'exam_id'));
+    const selectedExam = requestedExamId
+      ? exams[0] || null
+      : exams.find((exam) => Number(exam.expected_result_count || 0) > Number(exam.entered_result_count || 0)) || null;
     const students = selectedExam ? await loadStudentsForExam(database, context.clientId, selectedExam) : [];
 
     return res.status(200).json({
@@ -1597,8 +1763,22 @@ async function saveMarksEntry(req, res) {
       }
     }
 
+    const classProgressRows = await loadReadyReportProgress(connection, clientId, [examGroupId]);
+    const { readyClassroomMap, readyClassReportMap } = buildReadyReportMaps(classProgressRows);
+    const readyClassReports = readyClassReportMap.get(examGroupId) || [];
+    const saveData = {
+      exam_group_id: examGroupId,
+      class_report_ready_count: readyClassReports.length,
+      ready_classroom_ids: readyClassroomMap.get(examGroupId) || [],
+      ready_class_reports: readyClassReports
+    };
+
     await connection.commit();
-    return res.status(200).json({ success: true, message: 'Marks saved successfully' });
+    return res.status(200).json({
+      success: true,
+      message: 'Marks saved successfully',
+      data: saveData
+    });
   } catch (error) {
     await connection.rollback();
     return sendDatabaseError(res, error);
@@ -1611,10 +1791,28 @@ async function loadResultRows(connection, clientId, examGroupId, filters = {}) {
   const conditions = ['e.exam_group_id = ?', 'e.client_id = ?', 'er.client_id = ?'];
   const values = [examGroupId, clientId, clientId];
   const examType = normalizeExamType(filters.examType || filters.exam_type, null);
+  const classroomId = normalizeOptionalPositiveInteger(filters.classroomId || filters.classroom_id);
+  const sectionId = normalizeOptionalPositiveInteger(filters.sectionId || filters.section_id);
+  const examId = normalizeOptionalPositiveInteger(filters.examId || filters.exam_id);
 
   if (examType) {
     conditions.push('e.exam_type = ?');
     values.push(examType);
+  }
+
+  if (classroomId) {
+    conditions.push('e.classroom_id = ?');
+    values.push(classroomId);
+  }
+
+  if (sectionId) {
+    conditions.push('e.section_id = ?');
+    values.push(sectionId);
+  }
+
+  if (examId) {
+    conditions.push('e.exam_id = ?');
+    values.push(examId);
   }
 
   const [rows] = await connection.query(`
@@ -1635,7 +1833,7 @@ async function loadResultRows(connection, clientId, examGroupId, filters = {}) {
       st.roll_number,
       CONCAT_WS(' ', st.first_name, st.middle_name, st.last_name) AS student_name
     FROM ${examResultsTable} er
-    INNER JOIN ${examsTable} e ON e.exam_id = er.exam_id
+    INNER JOIN ${examsTable} e ON e.exam_id = er.exam_id AND e.client_id = er.client_id
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = e.classroom_id
     LEFT JOIN ${sectionsTable} sec ON sec.section_id = e.section_id
     LEFT JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
@@ -1645,6 +1843,15 @@ async function loadResultRows(connection, clientId, examGroupId, filters = {}) {
   `, values);
 
   return rows;
+}
+
+function resultFiltersFromRequest(req) {
+  return {
+    examType: examTypeFromRequest(req),
+    classroomId: getValue(req.body, 'classroomId', 'classroom_id') || getValue(req.query, 'classroomId', 'classroom_id'),
+    sectionId: getValue(req.body, 'sectionId', 'section_id') || getValue(req.query, 'sectionId', 'section_id'),
+    examId: getValue(req.body, 'examId', 'exam_id') || getValue(req.query, 'examId', 'exam_id')
+  };
 }
 
 function computeResultSummary(rows) {
@@ -1780,7 +1987,8 @@ async function processResults(req, res) {
     const connection = await pool.promise().getConnection();
     try {
       await connection.beginTransaction();
-      const rows = await loadResultRows(connection, context.clientId, context.examGroupId);
+      const filters = resultFiltersFromRequest(req);
+      const rows = await loadResultRows(connection, context.clientId, context.examGroupId, filters);
       if (!rows.length) {
         await connection.rollback();
         return res.status(400).json({ success: false, message: 'Enter marks before processing results' });
@@ -1798,7 +2006,13 @@ async function processResults(req, res) {
           WHERE exam_resu_id = ?
         `, [status, grade, row.exam_subject_id, maxMarks, Number(row.passing_marks || row.exam_passing_marks || 0), row.exam_resu_id]);
       }
-      await connection.query(`UPDATE ${examGroupsTable} SET status = 'COMPLETED' WHERE exam_group_id = ? AND client_id = ?`, [context.examGroupId, context.clientId]);
+      const isPartialProcessing = normalizeOptionalPositiveInteger(filters.classroomId)
+        || normalizeOptionalPositiveInteger(filters.sectionId)
+        || normalizeOptionalPositiveInteger(filters.examId)
+        || normalizeExamType(filters.examType, null);
+      if (!isPartialProcessing) {
+        await connection.query(`UPDATE ${examGroupsTable} SET status = 'COMPLETED' WHERE exam_group_id = ? AND client_id = ?`, [context.examGroupId, context.clientId]);
+      }
       await connection.commit();
     } catch (error) {
       await connection.rollback();
@@ -1807,7 +2021,7 @@ async function processResults(req, res) {
       connection.release();
     }
 
-    const rows = await loadResultRows(pool.promise(), context.clientId, context.examGroupId);
+    const rows = await loadResultRows(pool.promise(), context.clientId, context.examGroupId, resultFiltersFromRequest(req));
     return res.status(200).json({
       success: true,
       message: 'Results processed successfully',
@@ -1844,7 +2058,7 @@ async function getReports(req, res) {
     }
 
     const reportType = normalizeText(req.query.type, 'progress_card');
-    const rows = await loadResultRows(pool.promise(), context.clientId, context.examGroupId, { examType: examTypeFromRequest(req) });
+    const rows = await loadResultRows(pool.promise(), context.clientId, context.examGroupId, resultFiltersFromRequest(req));
     const summary = computeResultSummary(rows);
     const payload = {
       report_type: reportType,

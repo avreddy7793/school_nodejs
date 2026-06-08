@@ -10,7 +10,7 @@ const schedulesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('
 const teachersTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teachers')}`;
 const syllabusUnitsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('syllabus_units')}`;
 const syllabusPlansTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('syllabus_plans')}`;
-const examTypes = ['Unit Test 1', 'Unit Test 2', 'Half Yearly', 'Unit Test 3', 'Unit Test 4', 'Pre Final', 'Final Exam', 'Online', 'Other'];
+const examTypes = ['Month Test', 'Unit Test 1', 'Unit Test 2', 'Half Yearly', 'Unit Test 3', 'Unit Test 4', 'Pre Final', 'Final Exam', 'Online', 'Other'];
 let examWorkflowSchemaReady = false;
 
 const selectableColumns = `
