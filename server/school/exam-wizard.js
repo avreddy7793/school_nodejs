@@ -99,6 +99,20 @@ function normalizeOptionalPositiveInteger(value) {
   return normalizePositiveInteger(value);
 }
 
+function normalizeOptionalPositiveIntegerList(value) {
+  if (value === undefined || value === null || value === '') {
+    return [];
+  }
+
+  const rawValues = Array.isArray(value)
+    ? value
+    : String(value).split(',');
+
+  return [...new Set(rawValues
+    .map((item) => normalizeOptionalPositiveInteger(String(item).trim()))
+    .filter(Boolean))];
+}
+
 function normalizeNonNegativeInteger(value, fallback = null) {
   if (value === undefined || value === null || value === '') {
     return fallback;
@@ -714,6 +728,18 @@ async function updateExamGroup(req, res) {
     }
 
     const database = pool.promise();
+    if (payload.status === 'COMPLETED') {
+      const classProgressRows = await loadReadyReportProgress(database, context.clientId, [context.examGroupId]);
+      const expected = classProgressRows.reduce((total, row) => total + Number(row.expected_result_count || 0), 0);
+      const entered = classProgressRows.reduce((total, row) => total + Number(row.entered_result_count || 0), 0);
+      if (!expected || entered < expected) {
+        return res.status(400).json({
+          success: false,
+          message: `Complete exam only after all marks are entered (${entered}/${expected})`
+        });
+      }
+    }
+
     if (Object.keys(payload).length) {
       await database.query(
         `UPDATE ${examGroupsTable} SET ? WHERE exam_group_id = ? AND client_id = ?`,
@@ -738,6 +764,13 @@ async function deleteExamGroup(req, res) {
     const context = await validateExamGroup(req, res);
     if (!context) {
       return null;
+    }
+
+    if (['COMPLETED', 'PUBLISHED'].includes(String(context.group.status || '').toUpperCase())) {
+      return res.status(400).json({
+        success: false,
+        message: 'Completed or published exams cannot be deleted'
+      });
     }
 
     const connection = await pool.promise().getConnection();
@@ -1977,6 +2010,246 @@ function scoreSort(first, second) {
   return second.percentage - first.percentage || second.total_marks - first.total_marks || String(first.student_name || '').localeCompare(String(second.student_name || ''));
 }
 
+function marksStatementFilters(req) {
+  const examType = examTypeFromRequest(req);
+  const examGroupIds = normalizeOptionalPositiveIntegerList(
+    getValue(req.query, 'examGroupIds', 'exam_group_ids') ||
+    getValue(req.query, 'examGroupId', 'exam_group_id')
+  );
+  return {
+    examGroupIds,
+    academicYear: normalizeText(getValue(req.query, 'academicYear', 'academic_year')),
+    classroomId: normalizeOptionalPositiveInteger(getValue(req.query, 'classroomId', 'classroom_id')),
+    sectionId: normalizeOptionalPositiveInteger(getValue(req.query, 'sectionId', 'section_id')),
+    studentId: normalizeOptionalPositiveInteger(getValue(req.query, 'studentId', 'student_id')),
+    examType
+  };
+}
+
+function computeMarksStatement(rows) {
+  const examTypes = Array.from(new Set(rows.map((row) => row.exam_type).filter(Boolean)))
+    .sort((first, second) => EXAM_TYPES.indexOf(first) - EXAM_TYPES.indexOf(second));
+  const studentMap = new Map();
+  const classMap = new Map();
+  const sectionMap = new Map();
+
+  rows.forEach((row) => {
+    if (row.classroom_id) {
+      classMap.set(Number(row.classroom_id), {
+        classroom_id: Number(row.classroom_id),
+        classroom_name: row.classroom_name || `Class #${row.classroom_id}`
+      });
+    }
+
+    if (row.section_id) {
+      sectionMap.set(Number(row.section_id), {
+        section_id: Number(row.section_id),
+        classroom_id: Number(row.classroom_id),
+        section_name: row.section_name || `Section #${row.section_id}`
+      });
+    }
+
+    const studentKey = String(row.student_id);
+    const student = studentMap.get(studentKey) || {
+      student_id: row.student_id,
+      admission_number: row.admission_number,
+      roll_number: row.roll_number,
+      student_name: row.student_name,
+      father_name: row.father_name,
+      mother_name: row.mother_name,
+      date_of_birth: row.date_of_birth,
+      student_photo: row.student_photo,
+      classroom_id: row.classroom_id,
+      classroom_name: row.classroom_name,
+      section_id: row.section_id,
+      section_name: row.section_name,
+      total_marks: 0,
+      max_marks: 0,
+      percentage: 0,
+      grade: '',
+      status: 'PASS',
+      class_rank: null,
+      section_rank: null,
+      subjects: []
+    };
+    const subjectKey = String(row.subject_id || row.subject_name || 'subject');
+    let subject = student.subjects.find((item) => String(item.subject_id || item.subject_name) === subjectKey);
+    if (!subject) {
+      subject = {
+        subject_id: row.subject_id,
+        subject_name: row.subject_name,
+        exam_types: {},
+        total_marks: 0,
+        max_marks: 0,
+        percentage: 0,
+        grade: '',
+        status: 'PASS'
+      };
+      student.subjects.push(subject);
+    }
+
+    const marks = row.status === 'ABSENT' ? 0 : Number(row.marks_obtained || 0);
+    const maxMarks = Number(row.max_marks || row.exam_total_marks || 0);
+    const passingMarks = Number(row.passing_marks || row.exam_passing_marks || 0);
+    const current = subject.exam_types[row.exam_type] || {
+      marks_obtained: 0,
+      max_marks: 0,
+      passing_marks: 0,
+      status: 'PASS',
+      grade: ''
+    };
+    current.marks_obtained += marks;
+    current.max_marks += maxMarks;
+    current.passing_marks += passingMarks;
+    current.status = current.status === 'FAIL' || row.status === 'ABSENT' || marks < passingMarks ? 'FAIL' : 'PASS';
+    current.grade = gradeFromPercentage(current.max_marks ? (current.marks_obtained / current.max_marks) * 100 : 0);
+    subject.exam_types[row.exam_type] = current;
+
+    subject.total_marks += marks;
+    subject.max_marks += maxMarks;
+    if (row.status === 'ABSENT' || marks < passingMarks) {
+      subject.status = 'FAIL';
+      student.status = 'FAIL';
+    }
+    student.total_marks += marks;
+    student.max_marks += maxMarks;
+    studentMap.set(studentKey, student);
+  });
+
+  const students = Array.from(studentMap.values()).map((student) => {
+    const percentage = student.max_marks ? (student.total_marks / student.max_marks) * 100 : 0;
+    const subjects = student.subjects.map((subject) => {
+      const subjectPercentage = subject.max_marks ? (subject.total_marks / subject.max_marks) * 100 : 0;
+      return {
+        ...subject,
+        percentage: Math.round(subjectPercentage * 100) / 100,
+        grade: gradeFromPercentage(subjectPercentage)
+      };
+    }).sort((first, second) => String(first.subject_name || '').localeCompare(String(second.subject_name || '')));
+
+    return {
+      ...student,
+      subjects,
+      percentage: Math.round(percentage * 100) / 100,
+      grade: gradeFromPercentage(percentage)
+    };
+  });
+
+  assignRanks(students, (row) => String(row.classroom_id || 'class'), 'class_rank');
+  assignRanks(students, (row) => `${row.classroom_id || 'class'}:${row.section_id || row.section_name || 'section'}`, 'section_rank');
+
+  return {
+    exam_types: examTypes,
+    classes: Array.from(classMap.values()).sort((first, second) => String(first.classroom_name).localeCompare(String(second.classroom_name))),
+    sections: Array.from(sectionMap.values()).sort((first, second) => String(first.section_name).localeCompare(String(second.section_name))),
+    students
+  };
+}
+
+async function getMarksStatement(req, res) {
+  const clientId = clientIdFrom(req);
+  if (!clientId) {
+    return res.status(400).json({ success: false, message: 'client_id is required' });
+  }
+
+  try {
+    const filters = marksStatementFilters(req);
+    const conditions = ['er.client_id = ?', 'e.client_id = ?', 'e.exam_group_id IS NOT NULL'];
+    const values = [clientId, clientId];
+
+    if (filters.examGroupIds.length) {
+      conditions.push('e.exam_group_id IN (?)');
+      values.push(filters.examGroupIds);
+    }
+
+    if (filters.academicYear) {
+      conditions.push('(e.academic_year = ? OR eg.academic_year = ?)');
+      values.push(filters.academicYear, filters.academicYear);
+    }
+
+    if (filters.classroomId) {
+      conditions.push('e.classroom_id = ?');
+      values.push(filters.classroomId);
+    }
+
+    if (filters.sectionId) {
+      conditions.push('e.section_id = ?');
+      values.push(filters.sectionId);
+    }
+
+    if (filters.studentId) {
+      conditions.push('er.student_id = ?');
+      values.push(filters.studentId);
+    }
+
+    if (filters.examType) {
+      conditions.push('e.exam_type = ?');
+      values.push(filters.examType);
+    }
+
+    const database = pool.promise();
+    const [rows, school] = await Promise.all([
+      database.query(`
+        SELECT
+          er.exam_resu_id,
+          er.exam_id,
+          er.student_id,
+          er.marks_obtained,
+          er.status,
+          er.grade,
+          er.remarks,
+          er.max_marks,
+          er.passing_marks,
+          e.exam_group_id,
+          e.exam_type,
+          e.academic_year,
+          e.classroom_id,
+          e.section_id,
+          e.subject_id,
+          e.total_marks AS exam_total_marks,
+          e.passing_marks AS exam_passing_marks,
+          e.exam_date,
+          eg.exam_name,
+          eg.academic_year AS group_academic_year,
+          c.name AS classroom_name,
+          sec.section_name,
+          s.sub_name AS subject_name,
+          st.admission_number,
+          st.roll_number,
+          st.father_name,
+          st.mother_name,
+          st.date_of_birth,
+          st.img AS student_photo,
+          CONCAT_WS(' ', st.first_name, st.middle_name, st.last_name) AS student_name
+        FROM ${examResultsTable} er
+        INNER JOIN ${examsTable} e ON e.exam_id = er.exam_id AND e.client_id = er.client_id
+        LEFT JOIN ${examGroupsTable} eg ON eg.exam_group_id = e.exam_group_id AND eg.client_id = e.client_id
+        LEFT JOIN ${classroomsTable} c ON c.classroom_id = e.classroom_id
+        LEFT JOIN ${sectionsTable} sec ON sec.section_id = e.section_id
+        LEFT JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
+        LEFT JOIN ${studentsTable} st ON st.student_id = er.student_id
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY c.name ASC, sec.section_name ASC, st.roll_number ASC, st.first_name ASC, s.sub_name ASC, e.exam_type ASC
+      `, values).then(([statementRows]) => statementRows),
+      loadSchoolBranding(database, clientId)
+    ]);
+    const statement = computeMarksStatement(rows);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        school,
+        generated_at: new Date(),
+        academic_year: filters.academicYear || rows[0]?.group_academic_year || rows[0]?.academic_year || null,
+        selected_exam_type: filters.examType || 'All',
+        ...statement
+      }
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+}
+
 async function processResults(req, res) {
   try {
     const context = await validateExamGroup(req, res);
@@ -2058,11 +2331,16 @@ async function getReports(req, res) {
     }
 
     const reportType = normalizeText(req.query.type, 'progress_card');
-    const rows = await loadResultRows(pool.promise(), context.clientId, context.examGroupId, resultFiltersFromRequest(req));
+    const database = pool.promise();
+    const [rows, school] = await Promise.all([
+      loadResultRows(database, context.clientId, context.examGroupId, resultFiltersFromRequest(req)),
+      loadSchoolBranding(database, context.clientId)
+    ]);
     const summary = computeResultSummary(rows);
     const payload = {
       report_type: reportType,
       exam_group: context.group,
+      school,
       generated_at: new Date(),
       ...summary
     };
@@ -2093,5 +2371,6 @@ module.exports = {
   saveMarksEntry,
   processResults,
   publishResults,
+  getMarksStatement,
   getReports
 };

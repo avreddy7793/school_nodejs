@@ -37,6 +37,7 @@ const examAdminAccess = [db.checkToken, examWizard.requireExamAdmin];
 
 router.get('/subjects', subjects.getSubjects);
 router.get('/wizard/dashboard', examAccess, examWizard.getDashboard);
+router.get('/reports/marks-statement', examAccess, examWizard.getMarksStatement);
 router.get('/groups', examAccess, examWizard.getExamGroups);
 router.post('/groups', examAdminAccess, examWizard.createExamGroup);
 router.get('/groups/:examGroupId/timetable/preview', examAccess, examWizard.previewTimetable);

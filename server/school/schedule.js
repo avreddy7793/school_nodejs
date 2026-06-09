@@ -7,6 +7,7 @@ const periodsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('se
 const schedulesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('class_schedule')}`;
 const teachersTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teachers')}`;
 const staffTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('staff')}`;
+const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
 const sectionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('sections')}`;
 const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('subjects')}`;
@@ -17,12 +18,14 @@ const legacyAttendanceTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdent
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
 const attendanceSettingsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('attendance_settings')}`;
 const STUDENT_ATTENDANCE_MODE_KEY = 'student_attendance_mode';
+const DEFAULT_TEACHER_ATTENDANCE_RADIUS_METERS = 200;
 const STUDENT_ATTENDANCE_MODES = new Set(['SESSION_WISE', 'PERIOD_WISE']);
 const STUDENT_ATTENDANCE_SESSIONS = new Set(['Session', 'Period', 'Morning', 'Afternoon']);
 const TEACHER_ATTENDANCE_SESSIONS = new Set(['Morning', 'Afternoon']);
 let studentAttendanceSchemaReady = null;
 let teacherAttendanceSchemaReady = null;
 let staffAttendanceSchemaReady = null;
+let clientLocationSchemaReady = null;
 
 function escapeIdentifier(value) {
   return `\`${String(value).replace(/`/g, '``')}\``;
@@ -52,6 +55,46 @@ function normalizeString(value) {
 function normalizePositiveInteger(value) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeFiniteNumber(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeLatitude(value) {
+  const parsed = normalizeFiniteNumber(value);
+  return parsed !== null && parsed >= -90 && parsed <= 90 ? parsed : null;
+}
+
+function normalizeLongitude(value) {
+  const parsed = normalizeFiniteNumber(value);
+  return parsed !== null && parsed >= -180 && parsed <= 180 ? parsed : null;
+}
+
+function isLocationRequiredAttendanceStatus(status) {
+  const normalized = normalizeString(status);
+  return normalized === 'Present' || normalized === 'Late';
+}
+
+function calculateDistanceMeters(startLatitude, startLongitude, endLatitude, endLongitude) {
+  const earthRadiusMeters = 6371000;
+  const toRadians = (value) => value * Math.PI / 180;
+  const latitudeDelta = toRadians(endLatitude - startLatitude);
+  const longitudeDelta = toRadians(endLongitude - startLongitude);
+  const startLatitudeRadians = toRadians(startLatitude);
+  const endLatitudeRadians = toRadians(endLatitude);
+
+  const haversine =
+    Math.sin(latitudeDelta / 2) * Math.sin(latitudeDelta / 2) +
+    Math.cos(startLatitudeRadians) * Math.cos(endLatitudeRadians) *
+    Math.sin(longitudeDelta / 2) * Math.sin(longitudeDelta / 2);
+
+  return earthRadiusMeters * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
 }
 
 function normalizeDayOfWeek(value) {
@@ -235,7 +278,11 @@ function buildAttendancePayload(body) {
     status: normalizeString(getValue(body, 'status')),
     check_in: normalizeString(getValue(body, 'checkIn')),
     notes: normalizeString(getValue(body, 'notes')),
-    marked_by: getValue(body, 'markedBy', null)
+    marked_by: getValue(body, 'markedBy', null),
+    latitude: normalizeLatitude(getValue(body, 'latitude', getValue(body, 'checkInLatitude', getValue(body, 'location_latitude')))),
+    longitude: normalizeLongitude(getValue(body, 'longitude', getValue(body, 'checkInLongitude', getValue(body, 'location_longitude')))),
+    location_accuracy: normalizeFiniteNumber(getValue(body, 'locationAccuracy', getValue(body, 'location_accuracy'))),
+    location_distance_meters: null
   };
 }
 
@@ -247,7 +294,149 @@ function buildStaffAttendancePayload(body) {
     status: normalizeString(getValue(body, 'status')),
     check_in: normalizeString(getValue(body, 'checkIn')),
     notes: normalizeString(getValue(body, 'notes')),
-    marked_by: getValue(body, 'markedBy', null)
+    marked_by: getValue(body, 'markedBy', null),
+    latitude: normalizeLatitude(getValue(body, 'latitude', getValue(body, 'checkInLatitude', getValue(body, 'location_latitude')))),
+    longitude: normalizeLongitude(getValue(body, 'longitude', getValue(body, 'checkInLongitude', getValue(body, 'location_longitude')))),
+    location_accuracy: normalizeFiniteNumber(getValue(body, 'locationAccuracy', getValue(body, 'location_accuracy'))),
+    location_distance_meters: null
+  };
+}
+
+function ensureAttendanceSettingsTableAsync() {
+  return new Promise((resolve, reject) => {
+    ensureAttendanceSettingsTable((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+function ensureClientLocationSchema() {
+  if (!clientLocationSchemaReady) {
+    clientLocationSchemaReady = (async () => {
+      const columns = await queryAsync(`SHOW COLUMNS FROM ${clientMasterTable}`);
+      const columnNames = new Set(columns.map((column) => column.Field));
+
+      if (!columnNames.has('latitude')) {
+        await queryAsync(`ALTER TABLE ${clientMasterTable} ADD COLUMN latitude VARCHAR(100) DEFAULT NULL AFTER gdt_number`);
+      }
+
+      if (!columnNames.has('longitude')) {
+        await queryAsync(`ALTER TABLE ${clientMasterTable} ADD COLUMN longitude VARCHAR(100) DEFAULT NULL AFTER latitude`);
+      }
+    })().catch((error) => {
+      clientLocationSchemaReady = null;
+      throw error;
+    });
+  }
+
+  return clientLocationSchemaReady;
+}
+
+async function loadTeacherAttendanceLocationSettings(clientId) {
+  await ensureClientLocationSchema();
+
+  const clientRows = await queryAsync(`
+    SELECT latitude, longitude
+    FROM ${clientMasterTable}
+    WHERE client_id = ?
+    LIMIT 1
+  `, [clientId]);
+
+  const schoolLatitude = normalizeLatitude(clientRows[0]?.latitude);
+  const schoolLongitude = normalizeLongitude(clientRows[0]?.longitude);
+
+  return {
+    school_latitude: schoolLatitude,
+    school_longitude: schoolLongitude,
+    radius_meters: DEFAULT_TEACHER_ATTENDANCE_RADIUS_METERS,
+    enabled: schoolLatitude !== null && schoolLongitude !== null
+  };
+}
+
+async function saveTeacherAttendanceLocationSettings(clientId, settings) {
+  await ensureClientLocationSchema();
+
+  const rawLatitude = settings.schoolLatitude ?? settings.school_latitude;
+  const rawLongitude = settings.schoolLongitude ?? settings.school_longitude;
+  const hasLatitudeValue = rawLatitude !== undefined && rawLatitude !== null && String(rawLatitude).trim() !== '';
+  const hasLongitudeValue = rawLongitude !== undefined && rawLongitude !== null && String(rawLongitude).trim() !== '';
+  const latitude = normalizeLatitude(rawLatitude);
+  const longitude = normalizeLongitude(rawLongitude);
+
+  if (hasLatitudeValue !== hasLongitudeValue) {
+    throw new Error('School latitude and longitude are both required.');
+  }
+
+  if (hasLatitudeValue && latitude === null) {
+    throw new Error('School latitude must be between -90 and 90.');
+  }
+
+  if (hasLongitudeValue && longitude === null) {
+    throw new Error('School longitude must be between -180 and 180.');
+  }
+
+  const updateResult = await queryAsync(`
+    UPDATE ${clientMasterTable}
+    SET latitude = ?,
+        longitude = ?
+    WHERE client_id = ?
+  `, [
+    hasLatitudeValue ? String(latitude) : null,
+    hasLongitudeValue ? String(longitude) : null,
+    clientId
+  ]);
+
+  if (!updateResult.affectedRows) {
+    throw new Error('School profile not found.');
+  }
+
+  return loadTeacherAttendanceLocationSettings(clientId);
+}
+
+async function validateAttendanceLocation(clientId, payload) {
+  if (!isLocationRequiredAttendanceStatus(payload.status)) {
+    return { success: true, skipped: true };
+  }
+
+  const settings = await loadTeacherAttendanceLocationSettings(clientId);
+  if (!settings.enabled) {
+    return { success: true, skipped: true, settings };
+  }
+
+  if (payload.latitude === null || payload.longitude === null) {
+    return {
+      success: false,
+      statusCode: 400,
+      message: 'Location is required for Present or Late attendance. Please allow location access and try again.'
+    };
+  }
+
+  const distance = calculateDistanceMeters(
+    settings.school_latitude,
+    settings.school_longitude,
+    payload.latitude,
+    payload.longitude
+  );
+  const roundedDistance = Math.round(distance * 100) / 100;
+  payload.location_distance_meters = roundedDistance;
+
+  if (distance > settings.radius_meters) {
+    return {
+      success: false,
+      statusCode: 403,
+      message: `Attendance is allowed only within ${settings.radius_meters} meters of the school. Current distance is ${(distance / 1000).toFixed(2)} km.`
+    };
+  }
+
+  return {
+    success: true,
+    distance_meters: roundedDistance,
+    settings
   };
 }
 
@@ -364,6 +553,22 @@ function ensureTeacherAttendanceSchema() {
         await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN marked_by INT DEFAULT NULL AFTER notes`);
       }
 
+      if (!columnNames.has('latitude')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN latitude DECIMAL(10, 7) DEFAULT NULL AFTER marked_by`);
+      }
+
+      if (!columnNames.has('longitude')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN longitude DECIMAL(10, 7) DEFAULT NULL AFTER latitude`);
+      }
+
+      if (!columnNames.has('location_accuracy')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN location_accuracy DECIMAL(10, 2) DEFAULT NULL AFTER longitude`);
+      }
+
+      if (!columnNames.has('location_distance_meters')) {
+        await queryAsync(`ALTER TABLE ${teacherAttendanceTable} ADD COLUMN location_distance_meters DECIMAL(10, 2) DEFAULT NULL AFTER location_accuracy`);
+      }
+
       await queryAsync(`
         ALTER TABLE ${teacherAttendanceTable}
         MODIFY status ENUM('Present','Late','Absent','On Leave') NOT NULL
@@ -396,6 +601,10 @@ function ensureStaffAttendanceSchema() {
           check_in TIME DEFAULT NULL,
           notes TEXT DEFAULT NULL,
           marked_by INT DEFAULT NULL,
+          latitude DECIMAL(10, 7) DEFAULT NULL,
+          longitude DECIMAL(10, 7) DEFAULT NULL,
+          location_accuracy DECIMAL(10, 2) DEFAULT NULL,
+          location_distance_meters DECIMAL(10, 2) DEFAULT NULL,
           created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
           PRIMARY KEY (attendance_id),
@@ -448,6 +657,22 @@ function ensureStaffAttendanceSchema() {
 
       if (!columnNames.has('marked_by')) {
         await queryAsync(`ALTER TABLE ${staffAttendanceTable} ADD COLUMN marked_by INT DEFAULT NULL AFTER notes`);
+      }
+
+      if (!columnNames.has('latitude')) {
+        await queryAsync(`ALTER TABLE ${staffAttendanceTable} ADD COLUMN latitude DECIMAL(10, 7) DEFAULT NULL AFTER marked_by`);
+      }
+
+      if (!columnNames.has('longitude')) {
+        await queryAsync(`ALTER TABLE ${staffAttendanceTable} ADD COLUMN longitude DECIMAL(10, 7) DEFAULT NULL AFTER latitude`);
+      }
+
+      if (!columnNames.has('location_accuracy')) {
+        await queryAsync(`ALTER TABLE ${staffAttendanceTable} ADD COLUMN location_accuracy DECIMAL(10, 2) DEFAULT NULL AFTER longitude`);
+      }
+
+      if (!columnNames.has('location_distance_meters')) {
+        await queryAsync(`ALTER TABLE ${staffAttendanceTable} ADD COLUMN location_distance_meters DECIMAL(10, 2) DEFAULT NULL AFTER location_accuracy`);
       }
 
       if (!columnNames.has('created_at')) {
@@ -942,6 +1167,56 @@ function updateStudentAttendanceSettings(req, res) {
   });
 }
 
+async function getTeacherAttendanceLocationSettings(req, res) {
+  const clientId = normalizePositiveInteger(req.query.client_id || req.decoded?.client_id);
+
+  if (!clientId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client id is required'
+    });
+  }
+
+  try {
+    const settings = await loadTeacherAttendanceLocationSettings(clientId);
+    return res.status(200).json({
+      success: true,
+      data: settings
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+}
+
+async function updateTeacherAttendanceLocationSettings(req, res) {
+  const clientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
+
+  if (!clientId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client id is required'
+    });
+  }
+
+  try {
+    const settings = await saveTeacherAttendanceLocationSettings(clientId, req.body);
+    return res.status(200).json({
+      success: true,
+      message: 'Teacher attendance location settings saved successfully',
+      data: settings
+    });
+  } catch (error) {
+    if (error.message?.startsWith('School ')) {
+      return res.status(400).json({
+        success: false,
+        message: error.message
+      });
+    }
+
+    return sendDatabaseError(res, error);
+  }
+}
+
 function assignTeacherToSchedule(req, res) {
   const scheduleId = normalizePositiveInteger(req.params.scheduleId);
   const teacherId = normalizePositiveInteger(getValue(req.body, 'teacherId', getValue(req.body, 'teacher_id')));
@@ -1183,6 +1458,10 @@ async function getTeacherAttendance(req, res) {
       ta.check_in,
       ta.notes,
       ta.marked_by,
+      ta.latitude,
+      ta.longitude,
+      ta.location_accuracy,
+      ta.location_distance_meters,
       ta.created_at,
       ta.updated_at
     FROM ${teacherAttendanceTable} ta
@@ -1207,28 +1486,27 @@ async function getTeacherAttendance(req, res) {
 async function saveTeacherAttendance(req, res) {
   try {
     await ensureTeacherAttendanceSchema();
-  } catch (error) {
-    return sendDatabaseError(res, error);
-  }
+    const payload = buildAttendancePayload(req.body);
+    const requestedClientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
 
-  const payload = buildAttendancePayload(req.body);
-  const requestedClientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
+    if (!payload.teacher_id || !payload.attendance_date || !payload.status) {
+      return res.status(400).json({
+        success: false,
+        message: 'Teacher, date, session, and status are required'
+      });
+    }
 
-  if (!payload.teacher_id || !payload.attendance_date || !payload.status) {
-    return res.status(400).json({
-      success: false,
-      message: 'Teacher, date, session, and status are required'
-    });
-  }
+    let scheduleClientId = null;
+    if (payload.schedule_id) {
+      const schedules = await queryAsync(`
+        SELECT client_id
+        FROM ${schedulesTable}
+        WHERE schedule_id = ?
+        LIMIT 1
+      `, [payload.schedule_id]);
+      scheduleClientId = schedules[0]?.client_id;
+    }
 
-  const scheduleSql = payload.schedule_id ? `
-    SELECT client_id
-    FROM ${schedulesTable}
-    WHERE schedule_id = ?
-    LIMIT 1
-  ` : null;
-
-  const saveRecord = (scheduleClientId = null) => {
     const clientId = requestedClientId || normalizePositiveInteger(scheduleClientId);
     if (!clientId) {
       return res.status(400).json({
@@ -1237,7 +1515,15 @@ async function saveTeacherAttendance(req, res) {
       });
     }
 
-    const findExistingSql = `
+    const locationResult = await validateAttendanceLocation(clientId, payload);
+    if (!locationResult.success) {
+      return res.status(locationResult.statusCode || 400).json({
+        success: false,
+        message: locationResult.message
+      });
+    }
+
+    const existingRows = await queryAsync(`
       SELECT attendance_id
       FROM ${teacherAttendanceTable}
       WHERE client_id = ?
@@ -1245,75 +1531,68 @@ async function saveTeacherAttendance(req, res) {
         AND attendance_date = ?
         AND attendance_session = ?
       LIMIT 1
-    `;
-    const findValues = [clientId, payload.teacher_id, payload.attendance_date, payload.attendance_session];
+    `, [clientId, payload.teacher_id, payload.attendance_date, payload.attendance_session]);
 
-    pool.query(findExistingSql, findValues, (findError, existingRows) => {
-      if (findError) {
-        return sendDatabaseError(res, findError);
-      }
+    if (existingRows.length) {
+      await queryAsync(`
+        UPDATE ${teacherAttendanceTable}
+        SET schedule_id = ?,
+            status = ?,
+            check_in = COALESCE(?, check_in, CURTIME()),
+            notes = ?,
+            marked_by = ?,
+            latitude = ?,
+            longitude = ?,
+            location_accuracy = ?,
+            location_distance_meters = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE attendance_id = ?
+      `, [
+        payload.schedule_id || null,
+        payload.status,
+        payload.check_in,
+        payload.notes,
+        payload.marked_by,
+        payload.latitude,
+        payload.longitude,
+        payload.location_accuracy,
+        payload.location_distance_meters,
+        existingRows[0].attendance_id
+      ]);
 
-      if (existingRows.length) {
-        const updateSql = `
-          UPDATE ${teacherAttendanceTable}
-          SET schedule_id = ?,
-              status = ?,
-              check_in = COALESCE(?, check_in, CURTIME()),
-              notes = ?,
-              marked_by = ?,
-              updated_at = CURRENT_TIMESTAMP
-          WHERE attendance_id = ?
-        `;
-
-        return pool.query(
-          updateSql,
-          [payload.schedule_id || null, payload.status, payload.check_in, payload.notes, payload.marked_by, existingRows[0].attendance_id],
-          (updateError) => {
-            if (updateError) {
-              return sendDatabaseError(res, updateError);
-            }
-
-            return res.status(200).json({
-              success: true,
-              message: 'Teacher attendance saved successfully'
-            });
-          }
-        );
-      }
-
-      const insertSql = `
-        INSERT INTO ${teacherAttendanceTable} (client_id, schedule_id, teacher_id, attendance_date, attendance_session, status, check_in, notes, marked_by)
-        VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURTIME()), ?, ?)
-      `;
-
-      return pool.query(
-        insertSql,
-        [clientId, payload.schedule_id || null, payload.teacher_id, payload.attendance_date, payload.attendance_session, payload.status, payload.check_in, payload.notes, payload.marked_by],
-        (insertError) => {
-          if (insertError) {
-            return sendDatabaseError(res, insertError);
-          }
-
-          return res.status(200).json({
-            success: true,
-            message: 'Teacher attendance saved successfully'
-          });
-        }
-      );
-    });
-  };
-
-  if (!scheduleSql) {
-    return saveRecord();
-  }
-
-  pool.query(scheduleSql, [payload.schedule_id], (scheduleError, schedules) => {
-    if (scheduleError) {
-      return sendDatabaseError(res, scheduleError);
+      return res.status(200).json({
+        success: true,
+        message: 'Teacher attendance saved successfully'
+      });
     }
 
-    return saveRecord(schedules[0]?.client_id);
-  });
+    await queryAsync(`
+      INSERT INTO ${teacherAttendanceTable}
+        (client_id, schedule_id, teacher_id, attendance_date, attendance_session, status, check_in, notes, marked_by, latitude, longitude, location_accuracy, location_distance_meters)
+      VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURTIME()), ?, ?, ?, ?, ?, ?)
+    `, [
+      clientId,
+      payload.schedule_id || null,
+      payload.teacher_id,
+      payload.attendance_date,
+      payload.attendance_session,
+      payload.status,
+      payload.check_in,
+      payload.notes,
+      payload.marked_by,
+      payload.latitude,
+      payload.longitude,
+      payload.location_accuracy,
+      payload.location_distance_meters
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Teacher attendance saved successfully'
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
 }
 
 async function getStaffAttendance(req, res) {
@@ -1362,6 +1641,10 @@ async function getStaffAttendance(req, res) {
       sa.check_in,
       sa.notes,
       sa.marked_by,
+      sa.latitude,
+      sa.longitude,
+      sa.location_accuracy,
+      sa.location_distance_meters,
       sa.created_at,
       sa.updated_at
     FROM ${staffAttendanceTable} sa
@@ -1385,31 +1668,22 @@ async function getStaffAttendance(req, res) {
 async function saveStaffAttendance(req, res) {
   try {
     await ensureStaffAttendanceSchema();
-  } catch (error) {
-    return sendDatabaseError(res, error);
-  }
+    const payload = buildStaffAttendancePayload(req.body);
+    const requestedClientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
 
-  const payload = buildStaffAttendancePayload(req.body);
-  const requestedClientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
-
-  if (!payload.staff_id || !payload.attendance_date || !payload.status) {
-    return res.status(400).json({
-      success: false,
-      message: 'Staff member, date, session, and status are required'
-    });
-  }
-
-  const staffSql = `
-    SELECT client_id
-    FROM ${staffTable}
-    WHERE staff_id = ?
-    LIMIT 1
-  `;
-
-  pool.query(staffSql, [payload.staff_id], (staffError, staffRows) => {
-    if (staffError) {
-      return sendDatabaseError(res, staffError);
+    if (!payload.staff_id || !payload.attendance_date || !payload.status) {
+      return res.status(400).json({
+        success: false,
+        message: 'Staff member, date, session, and status are required'
+      });
     }
+
+    const staffRows = await queryAsync(`
+      SELECT client_id
+      FROM ${staffTable}
+      WHERE staff_id = ?
+      LIMIT 1
+    `, [payload.staff_id]);
 
     if (!staffRows.length) {
       return res.status(404).json({
@@ -1426,7 +1700,15 @@ async function saveStaffAttendance(req, res) {
       });
     }
 
-    const findExistingSql = `
+    const locationResult = await validateAttendanceLocation(clientId, payload);
+    if (!locationResult.success) {
+      return res.status(locationResult.statusCode || 400).json({
+        success: false,
+        message: locationResult.message
+      });
+    }
+
+    const existingRows = await queryAsync(`
       SELECT attendance_id
       FROM ${staffAttendanceTable}
       WHERE client_id = ?
@@ -1434,62 +1716,65 @@ async function saveStaffAttendance(req, res) {
         AND attendance_date = ?
         AND attendance_session = ?
       LIMIT 1
-    `;
-    const findValues = [clientId, payload.staff_id, payload.attendance_date, payload.attendance_session];
+    `, [clientId, payload.staff_id, payload.attendance_date, payload.attendance_session]);
 
-    pool.query(findExistingSql, findValues, (findError, existingRows) => {
-      if (findError) {
-        return sendDatabaseError(res, findError);
-      }
+    if (existingRows.length) {
+      await queryAsync(`
+        UPDATE ${staffAttendanceTable}
+        SET status = ?,
+            check_in = COALESCE(?, check_in, CURTIME()),
+            notes = ?,
+            marked_by = ?,
+            latitude = ?,
+            longitude = ?,
+            location_accuracy = ?,
+            location_distance_meters = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE attendance_id = ?
+      `, [
+        payload.status,
+        payload.check_in,
+        payload.notes,
+        payload.marked_by,
+        payload.latitude,
+        payload.longitude,
+        payload.location_accuracy,
+        payload.location_distance_meters,
+        existingRows[0].attendance_id
+      ]);
 
-      if (existingRows.length) {
-        const updateSql = `
-          UPDATE ${staffAttendanceTable}
-          SET status = ?,
-              check_in = COALESCE(?, check_in, CURTIME()),
-              notes = ?,
-              marked_by = ?,
-              updated_at = CURRENT_TIMESTAMP
-          WHERE attendance_id = ?
-        `;
+      return res.status(200).json({
+        success: true,
+        message: 'Staff attendance saved successfully'
+      });
+    }
 
-        return pool.query(
-          updateSql,
-          [payload.status, payload.check_in, payload.notes, payload.marked_by, existingRows[0].attendance_id],
-          (updateError) => {
-            if (updateError) {
-              return sendDatabaseError(res, updateError);
-            }
+    await queryAsync(`
+      INSERT INTO ${staffAttendanceTable}
+        (client_id, staff_id, attendance_date, attendance_session, status, check_in, notes, marked_by, latitude, longitude, location_accuracy, location_distance_meters)
+      VALUES (?, ?, ?, ?, ?, COALESCE(?, CURTIME()), ?, ?, ?, ?, ?, ?)
+    `, [
+      clientId,
+      payload.staff_id,
+      payload.attendance_date,
+      payload.attendance_session,
+      payload.status,
+      payload.check_in,
+      payload.notes,
+      payload.marked_by,
+      payload.latitude,
+      payload.longitude,
+      payload.location_accuracy,
+      payload.location_distance_meters
+    ]);
 
-            return res.status(200).json({
-              success: true,
-              message: 'Staff attendance saved successfully'
-            });
-          }
-        );
-      }
-
-      const insertSql = `
-        INSERT INTO ${staffAttendanceTable} (client_id, staff_id, attendance_date, attendance_session, status, check_in, notes, marked_by)
-        VALUES (?, ?, ?, ?, ?, COALESCE(?, CURTIME()), ?, ?)
-      `;
-
-      return pool.query(
-        insertSql,
-        [clientId, payload.staff_id, payload.attendance_date, payload.attendance_session, payload.status, payload.check_in, payload.notes, payload.marked_by],
-        (insertError) => {
-          if (insertError) {
-            return sendDatabaseError(res, insertError);
-          }
-
-          return res.status(200).json({
-            success: true,
-            message: 'Staff attendance saved successfully'
-          });
-        }
-      );
+    return res.status(200).json({
+      success: true,
+      message: 'Staff attendance saved successfully'
     });
-  });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
 }
 
 async function getStudentAttendance(req, res) {
@@ -1704,6 +1989,8 @@ module.exports = {
   deleteSchedule,
   getStudentAttendanceSettings,
   updateStudentAttendanceSettings,
+  getTeacherAttendanceLocationSettings,
+  updateTeacherAttendanceLocationSettings,
   getStudentsForSchedule,
   getTeacherAttendance,
   saveTeacherAttendance,
