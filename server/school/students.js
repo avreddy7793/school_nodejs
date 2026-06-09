@@ -71,7 +71,8 @@ const selectableColumns = `
   s.created_at,
   s.updated_at,
   s.created_by,
-  s.updated_by
+  s.updated_by,
+  s.img
 `;
 
 function escapeIdentifier(value) {
@@ -132,7 +133,8 @@ const fieldMap = {
   sportsParticipation: 'sports_participation',
   achievements: 'achievements',
   createdBy: 'created_by',
-  updatedBy: 'updated_by'
+  updatedBy: 'updated_by',
+  img: 'img'
 };
 
 function today() {
@@ -273,7 +275,8 @@ function buildStudentPayload(body) {
     sports_participation: getValue(body, 'sportsParticipation'),
     achievements: getValue(body, 'achievements'),
     created_by: getValue(body, 'createdBy'),
-    updated_by: getValue(body, 'updatedBy')
+    updated_by: getValue(body, 'updatedBy'),
+    img: getValue(body, 'img')
   };
 }
 
