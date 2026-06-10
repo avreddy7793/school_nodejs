@@ -1,8 +1,15 @@
+const crypto = require('crypto');
 const { pool } = require('../config');
+const { deleteHostedFile, isHostedUrl } = require('./hostinger-storage');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
 const schoolSettingsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('school_settings')}`;
+const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
+const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
+const sectionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('sections')}`;
+const academicYearPromotionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('student_academic_year_promotions')}`;
+const loginTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('login')}`;
 
 function escapeIdentifier(value) {
   return `\`${String(value).replace(/`/g, '``')}\``;
@@ -38,6 +45,27 @@ function getValue(body, camelKey, snakeKey = camelKey) {
   return body[snakeKey];
 }
 
+function hashPassword(password) {
+  const salt = crypto.randomBytes(Math.ceil(15 / 2)).toString('hex').slice(0, 15);
+  const hash = crypto.createHmac('sha512', salt);
+  hash.update(password);
+
+  return {
+    salt,
+    passkey: hash.digest('hex')
+  };
+}
+
+function passwordMatches(password, salt, passkey) {
+  if (!password || !salt || !passkey) {
+    return false;
+  }
+
+  const hash = crypto.createHmac('sha512', salt);
+  hash.update(password);
+  return hash.digest('hex') === passkey;
+}
+
 function normalizeDate(value) {
   if (!value) {
     return null;
@@ -47,11 +75,68 @@ function normalizeDate(value) {
   return Number.isNaN(date.getTime()) ? null : String(value).slice(0, 10);
 }
 
+function academicYearParts(value) {
+  const text = normalizeText(value);
+  if (!text) {
+    return null;
+  }
+
+  const matches = text.match(/\d{2,4}/g);
+  if (!matches?.length || matches[0].length !== 4) {
+    return null;
+  }
+
+  const startYear = Number(matches[0]);
+  let endYear = matches[1]
+    ? Number(matches[1].length === 2 ? `${String(startYear).slice(0, 2)}${matches[1]}` : matches[1])
+    : startYear + 1;
+
+  if (endYear < startYear) {
+    endYear += 100;
+  }
+
+  if (!Number.isInteger(startYear) || !Number.isInteger(endYear) || endYear <= startYear) {
+    return null;
+  }
+
+  return { startYear, endYear };
+}
+
+function formatAcademicYear(startYear, endYear) {
+  return `${startYear}-${String(endYear).slice(-2)}`;
+}
+
+function normalizeAcademicYear(value) {
+  const text = normalizeText(value);
+  if (!text) {
+    return null;
+  }
+
+  const parts = academicYearParts(text);
+  return parts ? formatAcademicYear(parts.startYear, parts.endYear) : text;
+}
+
+function academicYearAliases(value) {
+  const text = normalizeText(value);
+  if (!text) {
+    return [];
+  }
+
+  const parts = academicYearParts(text);
+  const aliases = new Set([text, normalizeAcademicYear(text)]);
+  if (parts) {
+    aliases.add(formatAcademicYear(parts.startYear, parts.endYear));
+    aliases.add(`${parts.startYear}-${parts.endYear}`);
+  }
+
+  return Array.from(aliases).filter(Boolean);
+}
+
 function defaultAcademicYear(today = new Date()) {
   const year = today.getFullYear();
   const month = today.getMonth();
   const startYear = month >= 5 ? year : year - 1;
-  return `${startYear}-${startYear + 1}`;
+  return formatAcademicYear(startYear, startYear + 1);
 }
 
 function defaultAcademicStart(today = new Date()) {
@@ -105,6 +190,335 @@ async function ensureSettingsSchema() {
       ADD UNIQUE KEY uq_school_settings_client_year (client_id, current_academic_year)
     `);
   }
+
+  await pool.promise().query(`
+    CREATE TABLE IF NOT EXISTS ${academicYearPromotionsTable} (
+      promotion_id bigint NOT NULL AUTO_INCREMENT,
+      batch_id varchar(64) NOT NULL,
+      client_id bigint NOT NULL,
+      student_id int NOT NULL,
+      from_academic_year varchar(20) NOT NULL,
+      to_academic_year varchar(20) NOT NULL,
+      from_classroom_id int DEFAULT NULL,
+      from_classroom_name varchar(100) DEFAULT NULL,
+      to_classroom_id int DEFAULT NULL,
+      to_classroom_name varchar(100) DEFAULT NULL,
+      from_section varchar(20) DEFAULT NULL,
+      to_section varchar(20) DEFAULT NULL,
+      from_roll_number int DEFAULT NULL,
+      to_roll_number int DEFAULT NULL,
+      from_enrollment_status varchar(20) DEFAULT NULL,
+      to_enrollment_status varchar(20) DEFAULT NULL,
+      action varchar(20) NOT NULL,
+      created_at timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (promotion_id),
+      KEY idx_student_year_promotions_batch (batch_id),
+      KEY idx_student_year_promotions_client_year (client_id, from_academic_year, to_academic_year),
+      KEY idx_student_year_promotions_student (student_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  `);
+}
+
+function classroomSortRank(name) {
+  const normalized = String(name || '').trim().toUpperCase();
+  if (!normalized) {
+    return 9999;
+  }
+
+  if (normalized.includes('NURSERY')) {
+    return -3;
+  }
+
+  if (normalized.includes('LKG')) {
+    return -2;
+  }
+
+  if (normalized.includes('UKG')) {
+    return -1;
+  }
+
+  const numberMatch = normalized.match(/\d+/);
+  return numberMatch ? Number(numberMatch[0]) : 9999;
+}
+
+function compareClassrooms(first, second) {
+  const firstRank = classroomSortRank(first.name);
+  const secondRank = classroomSortRank(second.name);
+  if (firstRank !== secondRank) {
+    return firstRank - secondRank;
+  }
+
+  return String(first.name || '').localeCompare(String(second.name || ''), undefined, {
+    numeric: true,
+    sensitivity: 'base'
+  });
+}
+
+function studentDisplayName(student) {
+  return [student.first_name, student.middle_name, student.last_name]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+}
+
+function chooseTargetSection(targetSections, currentSection) {
+  if (!targetSections.length) {
+    return null;
+  }
+
+  const normalizedSection = String(currentSection || '').trim().toLowerCase();
+  const matchingSection = targetSections.find((section) =>
+    String(section.section_name || '').trim().toLowerCase() === normalizedSection
+  );
+
+  return matchingSection?.section_name || targetSections[0].section_name;
+}
+
+function promotionClassKey(item) {
+  return [
+    item.action,
+    item.from_classroom_id || '',
+    item.to_classroom_id || '',
+    item.from_section || '',
+    item.to_section || ''
+  ].join('|');
+}
+
+function summarizePromotionPlan(plan) {
+  const classMap = new Map();
+
+  for (const item of plan) {
+    const key = promotionClassKey(item);
+    const current = classMap.get(key) || {
+      action: item.action,
+      from_classroom_id: item.from_classroom_id,
+      from_classroom_name: item.from_classroom_name,
+      to_classroom_id: item.to_classroom_id,
+      to_classroom_name: item.to_classroom_name,
+      from_section: item.from_section,
+      to_section: item.to_section,
+      reason: item.reason || null,
+      student_count: 0
+    };
+
+    current.student_count += 1;
+    classMap.set(key, current);
+  }
+
+  return Array.from(classMap.values()).sort((first, second) =>
+    compareClassrooms(
+      { name: first.from_classroom_name || '' },
+      { name: second.from_classroom_name || '' }
+    )
+  );
+}
+
+function promotionSummary(plan) {
+  return {
+    total_students: plan.length,
+    promotable_students: plan.filter((item) => item.action === 'PROMOTE').length,
+    alumni_students: plan.filter((item) => item.action === 'ALUMNI').length,
+    blocked_students: plan.filter((item) => item.action === 'BLOCKED').length
+  };
+}
+
+function promotionResponseData(clientId, fromAcademicYear, toAcademicYear, plan, extra = {}) {
+  const blockedStudents = plan.filter((item) => item.action === 'BLOCKED');
+
+  return {
+    client_id: clientId,
+    from_academic_year: normalizeAcademicYear(fromAcademicYear),
+    to_academic_year: normalizeAcademicYear(toAcademicYear),
+    summary: promotionSummary(plan),
+    classes: summarizePromotionPlan(plan),
+    sample_students: plan.slice(0, 30),
+    blocked_students: blockedStudents.slice(0, 30),
+    ...extra
+  };
+}
+
+async function buildAcademicYearRolloverPlan(connection, clientId, fromAcademicYear, toAcademicYear, options = {}) {
+  const fromAliases = academicYearAliases(fromAcademicYear);
+  const lockClause = options.lockStudents ? 'FOR UPDATE' : '';
+
+  const [classrooms] = await connection.query(`
+    SELECT classroom_id, name
+    FROM ${classroomsTable}
+    WHERE client_id = ?
+    ORDER BY name ASC
+  `, [clientId]);
+
+  const orderedClassrooms = classrooms.slice().sort(compareClassrooms);
+  const classroomIndex = new Map(
+    orderedClassrooms.map((classroom, index) => [Number(classroom.classroom_id), index])
+  );
+
+  const [sections] = await connection.query(`
+    SELECT section_id, classroom_id, section_name
+    FROM ${sectionsTable}
+    WHERE client_id = ?
+    ORDER BY section_name ASC
+  `, [clientId]);
+
+  const sectionsByClassroom = new Map();
+  for (const section of sections) {
+    const key = Number(section.classroom_id);
+    const list = sectionsByClassroom.get(key) || [];
+    list.push(section);
+    sectionsByClassroom.set(key, list);
+  }
+
+  const [students] = await connection.query(`
+    SELECT
+      s.student_id,
+      s.admission_number,
+      s.first_name,
+      s.middle_name,
+      s.last_name,
+      s.class_name,
+      c.name AS class_display_name,
+      s.section,
+      s.roll_number,
+      s.academic_year,
+      s.enrollment_status
+    FROM ${studentsTable} s
+    LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.class_name
+    WHERE s.client_id = ?
+      AND s.academic_year IN (?)
+      AND s.enrollment_status = 'Active'
+    ORDER BY
+      COALESCE(c.name, ''),
+      s.section,
+      COALESCE(s.roll_number, 99999),
+      s.first_name,
+      s.last_name,
+      s.student_id
+    ${lockClause}
+  `, [clientId, fromAliases]);
+
+  return students.map((student) => {
+    const fromClassroomId = Number(student.class_name) || null;
+    const fromClassroomIndex = fromClassroomId ? classroomIndex.get(fromClassroomId) : undefined;
+    const fromClassroom = fromClassroomIndex === undefined ? null : orderedClassrooms[fromClassroomIndex];
+    const nextClassroom = fromClassroomIndex === undefined ? null : orderedClassrooms[fromClassroomIndex + 1] || null;
+    const base = {
+      student_id: student.student_id,
+      admission_number: student.admission_number,
+      student_name: studentDisplayName(student),
+      from_classroom_id: fromClassroomId,
+      from_classroom_name: student.class_display_name || fromClassroom?.name || null,
+      from_section: student.section || null,
+      from_roll_number: student.roll_number || null,
+      from_enrollment_status: student.enrollment_status || null,
+      to_classroom_id: null,
+      to_classroom_name: null,
+      to_section: null,
+      to_roll_number: null,
+      to_enrollment_status: 'Active',
+      action: 'BLOCKED',
+      reason: null
+    };
+
+    if (fromClassroomIndex === undefined) {
+      return {
+        ...base,
+        reason: 'Current class is missing from class setup.'
+      };
+    }
+
+    if (!nextClassroom) {
+      return {
+        ...base,
+        to_enrollment_status: 'Alumni',
+        action: 'ALUMNI',
+        reason: 'Highest configured class; student will be marked Alumni.'
+      };
+    }
+
+    const targetSections = sectionsByClassroom.get(Number(nextClassroom.classroom_id)) || [];
+    const targetSection = chooseTargetSection(targetSections, student.section);
+    if (!targetSection) {
+      return {
+        ...base,
+        to_classroom_id: nextClassroom.classroom_id,
+        to_classroom_name: nextClassroom.name,
+        reason: 'Target class has no sections configured.'
+      };
+    }
+
+    return {
+      ...base,
+      to_classroom_id: nextClassroom.classroom_id,
+      to_classroom_name: nextClassroom.name,
+      to_section: targetSection,
+      action: 'PROMOTE',
+      reason: null
+    };
+  });
+}
+
+function rollKey(classroomId, section) {
+  return `${classroomId || ''}|${String(section || '').trim().toLowerCase()}`;
+}
+
+async function loadRollCounters(connection, clientId, academicYear) {
+  const [rows] = await connection.query(`
+    SELECT class_name, section, MAX(COALESCE(roll_number, 0)) AS max_roll
+    FROM ${studentsTable}
+    WHERE client_id = ?
+      AND academic_year IN (?)
+    GROUP BY class_name, section
+  `, [clientId, academicYearAliases(academicYear)]);
+
+  return new Map(rows.map((row) => [
+    rollKey(row.class_name, row.section),
+    Number(row.max_roll || 0)
+  ]));
+}
+
+function nextRollNumber(rollCounters, classroomId, section) {
+  const key = rollKey(classroomId, section);
+  const next = Number(rollCounters.get(key) || 0) + 1;
+  rollCounters.set(key, next);
+  return next;
+}
+
+function buildBatchId() {
+  return typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+}
+
+async function insertPromotionAudit(connection, batchId, clientId, fromAcademicYear, toAcademicYear, item) {
+  await connection.query(`INSERT INTO ${academicYearPromotionsTable} SET ?`, {
+    batch_id: batchId,
+    client_id: clientId,
+    student_id: item.student_id,
+    from_academic_year: normalizeAcademicYear(fromAcademicYear),
+    to_academic_year: normalizeAcademicYear(toAcademicYear),
+    from_classroom_id: item.from_classroom_id,
+    from_classroom_name: item.from_classroom_name,
+    to_classroom_id: item.to_classroom_id,
+    to_classroom_name: item.to_classroom_name,
+    from_section: item.from_section,
+    to_section: item.to_section,
+    from_roll_number: item.from_roll_number,
+    to_roll_number: item.to_roll_number,
+    from_enrollment_status: item.from_enrollment_status,
+    to_enrollment_status: item.to_enrollment_status,
+    action: item.action
+  });
+}
+
+async function saveAcademicCalendar(connection, clientId, payload) {
+  await connection.query(`
+    INSERT INTO ${schoolSettingsTable}
+      (client_id, current_academic_year, academic_year_start_date, academic_year_end_date)
+    VALUES (?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+      academic_year_start_date = VALUES(academic_year_start_date),
+      academic_year_end_date = VALUES(academic_year_end_date)
+  `, [clientId, payload.current_academic_year, payload.academic_year_start_date, payload.academic_year_end_date]);
 }
 
 function mapBranding(row) {
@@ -128,6 +542,18 @@ function selectBranding(clientId, callback) {
   `;
 
   pool.query(sql, [clientId], callback);
+}
+
+async function deleteHostedFileQuietly(url) {
+  if (!isHostedUrl(url)) {
+    return;
+  }
+
+  try {
+    await deleteHostedFile(url);
+  } catch (error) {
+    console.warn('Unable to delete hosted school image:', error.message);
+  }
 }
 
 async function getSchoolBranding(req, res) {
@@ -167,32 +593,48 @@ async function getSchoolBranding(req, res) {
 async function updateSchoolBranding(req, res) {
   try {
     await ensureBrandingSchema();
-  } catch (error) {
-    return sendDatabaseError(res, error);
-  }
 
-  const clientId = normalizePositiveInteger(getValue(req.body, 'clientId', 'client_id') || req.query.client_id || req.decoded?.client_id);
-  if (!clientId) {
-    return res.status(400).json({
-      success: false,
-      message: 'Client id is required'
-    });
-  }
-
-  const payload = {
-    client_name: normalizeText(getValue(req.body, 'schoolName', 'school_name')),
-    client_address: normalizeText(getValue(req.body, 'schoolAddress', 'school_address')),
-    img: normalizeText(getValue(req.body, 'schoolLogoUrl', 'school_logo_url')),
-    mobile_number: normalizeText(getValue(req.body, 'phoneNumber', 'phone_number')),
-    email: normalizeText(getValue(req.body, 'email'))
-  };
-
-  const sql = `UPDATE ${clientMasterTable} SET ? WHERE client_id = ?`;
-  pool.query(sql, [payload, clientId], (error, result) => {
-    if (error) {
-      return sendDatabaseError(res, error);
+    const clientId = normalizePositiveInteger(
+      getValue(req.body, 'clientId', 'client_id') ||
+      req.query.client_id ||
+      req.decoded?.client_id ||
+      req.decoded?.clientid
+    );
+    if (!clientId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Client id is required'
+      });
     }
 
+    const payload = {
+      client_name: normalizeText(getValue(req.body, 'schoolName', 'school_name')),
+      client_address: normalizeText(getValue(req.body, 'schoolAddress', 'school_address')),
+      img: normalizeText(getValue(req.body, 'schoolLogoUrl', 'school_logo_url')),
+      mobile_number: normalizeText(getValue(req.body, 'phoneNumber', 'phone_number')),
+      email: normalizeText(getValue(req.body, 'email'))
+    };
+
+    const database = pool.promise();
+    const [existingRows] = await database.query(
+      `
+        SELECT client_id, client_name, client_address, img, owner_name, mobile_number, email
+        FROM ${clientMasterTable}
+        WHERE client_id = ?
+        LIMIT 1
+      `,
+      [clientId]
+    );
+
+    if (!existingRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'School profile not found'
+      });
+    }
+
+    const oldLogoUrl = existingRows[0].img || '';
+    const [result] = await database.query(`UPDATE ${clientMasterTable} SET ? WHERE client_id = ?`, [payload, clientId]);
     if (!result.affectedRows) {
       return res.status(404).json({
         success: false,
@@ -200,18 +642,28 @@ async function updateSchoolBranding(req, res) {
       });
     }
 
-    return selectBranding(clientId, (selectError, results) => {
-      if (selectError) {
-        return sendDatabaseError(res, selectError);
-      }
+    const [results] = await database.query(
+      `
+        SELECT client_id, client_name, client_address, img, owner_name, mobile_number, email
+        FROM ${clientMasterTable}
+        WHERE client_id = ?
+        LIMIT 1
+      `,
+      [clientId]
+    );
 
-      return res.status(200).json({
-        success: true,
-        message: 'School branding saved successfully',
-        data: mapBranding(results[0])
-      });
+    if (oldLogoUrl && oldLogoUrl !== payload.img) {
+      deleteHostedFileQuietly(oldLogoUrl);
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'School branding saved successfully',
+      data: mapBranding(results[0])
     });
-  });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
 }
 
 async function getAcademicCalendar(req, res) {
@@ -251,7 +703,7 @@ async function getAcademicCalendar(req, res) {
       success: true,
       data: {
         client_id: clientId,
-        current_academic_year: row.current_academic_year || defaultAcademicYear(),
+        current_academic_year: normalizeAcademicYear(row.current_academic_year) || defaultAcademicYear(),
         academic_year_start_date: row.academic_year_start_date || defaultAcademicStart(),
         academic_year_end_date: row.academic_year_end_date || defaultAcademicEnd()
       }
@@ -275,7 +727,7 @@ async function updateAcademicCalendar(req, res) {
   }
 
   const payload = {
-    current_academic_year: normalizeText(getValue(req.body, 'currentAcademicYear', 'current_academic_year')) || defaultAcademicYear(),
+    current_academic_year: normalizeAcademicYear(getValue(req.body, 'currentAcademicYear', 'current_academic_year')) || defaultAcademicYear(),
     academic_year_start_date: normalizeDate(getValue(req.body, 'academicYearStartDate', 'academic_year_start_date')),
     academic_year_end_date: normalizeDate(getValue(req.body, 'academicYearEndDate', 'academic_year_end_date'))
   };
@@ -317,9 +769,281 @@ async function updateAcademicCalendar(req, res) {
   });
 }
 
+async function previewAcademicYearRollover(req, res) {
+  try {
+    await ensureSettingsSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
+  const clientId = normalizePositiveInteger(req.query.client_id || req.query.clientId || req.decoded?.client_id);
+  const fromAcademicYear = normalizeAcademicYear(req.query.from_academic_year || req.query.fromAcademicYear);
+  const toAcademicYear = normalizeAcademicYear(req.query.to_academic_year || req.query.toAcademicYear);
+
+  if (!clientId || !fromAcademicYear || !toAcademicYear) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client, from academic year, and to academic year are required'
+    });
+  }
+
+  if (fromAcademicYear === toAcademicYear) {
+    return res.status(400).json({
+      success: false,
+      message: 'From and to academic year must be different'
+    });
+  }
+
+  try {
+    const plan = await buildAcademicYearRolloverPlan(pool.promise(), clientId, fromAcademicYear, toAcademicYear);
+
+    return res.status(200).json({
+      success: true,
+      data: promotionResponseData(clientId, fromAcademicYear, toAcademicYear, plan)
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+}
+
+async function applyAcademicYearRollover(req, res) {
+  try {
+    await ensureSettingsSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
+  const clientId = normalizePositiveInteger(getValue(req.body, 'clientId', 'client_id') || req.query.client_id || req.decoded?.client_id);
+  const fromAcademicYear = normalizeAcademicYear(getValue(req.body, 'fromAcademicYear', 'from_academic_year'));
+  const toAcademicYear = normalizeAcademicYear(getValue(req.body, 'toAcademicYear', 'to_academic_year'));
+  const payload = {
+    current_academic_year: toAcademicYear,
+    academic_year_start_date: normalizeDate(getValue(req.body, 'academicYearStartDate', 'academic_year_start_date')),
+    academic_year_end_date: normalizeDate(getValue(req.body, 'academicYearEndDate', 'academic_year_end_date'))
+  };
+
+  if (!clientId || !fromAcademicYear || !toAcademicYear) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client, from academic year, and to academic year are required'
+    });
+  }
+
+  if (fromAcademicYear === toAcademicYear) {
+    return res.status(400).json({
+      success: false,
+      message: 'From and to academic year must be different'
+    });
+  }
+
+  if (!payload.academic_year_start_date || !payload.academic_year_end_date) {
+    return res.status(400).json({
+      success: false,
+      message: 'New academic year start and end dates are required'
+    });
+  }
+
+  if (payload.academic_year_end_date < payload.academic_year_start_date) {
+    return res.status(400).json({
+      success: false,
+      message: 'Academic end date cannot be before start date'
+    });
+  }
+
+  const connection = await pool.promise().getConnection();
+  const batchId = buildBatchId();
+
+  try {
+    await connection.beginTransaction();
+
+    const plan = await buildAcademicYearRolloverPlan(connection, clientId, fromAcademicYear, toAcademicYear, {
+      lockStudents: true
+    });
+    const summary = promotionSummary(plan);
+
+    if (!summary.total_students) {
+      await connection.rollback();
+      return res.status(400).json({
+        success: false,
+        message: `No active students found in ${fromAcademicYear}`
+      });
+    }
+
+    if (summary.blocked_students) {
+      await connection.rollback();
+      return res.status(400).json({
+        success: false,
+        message: 'Some students cannot be promoted. Preview the rollover and fix missing classes or sections first.',
+        data: promotionResponseData(clientId, fromAcademicYear, toAcademicYear, plan)
+      });
+    }
+
+    const rollCounters = await loadRollCounters(connection, clientId, toAcademicYear);
+    const appliedPlan = [];
+
+    for (const item of plan) {
+      if (item.action === 'PROMOTE') {
+        const toRollNumber = nextRollNumber(rollCounters, item.to_classroom_id, item.to_section);
+        const appliedItem = {
+          ...item,
+          to_roll_number: toRollNumber
+        };
+
+        await connection.query(`
+          UPDATE ${studentsTable}
+          SET
+            academic_year = ?,
+            class_name = ?,
+            grade_level = ?,
+            current_grade = ?,
+            section = ?,
+            roll_number = ?,
+            enrollment_status = 'Active'
+          WHERE student_id = ?
+            AND client_id = ?
+        `, [
+          toAcademicYear,
+          item.to_classroom_id,
+          item.to_classroom_name,
+          item.to_classroom_name,
+          item.to_section,
+          toRollNumber,
+          item.student_id,
+          clientId
+        ]);
+
+        await insertPromotionAudit(connection, batchId, clientId, fromAcademicYear, toAcademicYear, appliedItem);
+        appliedPlan.push(appliedItem);
+        continue;
+      }
+
+      const appliedItem = {
+        ...item,
+        to_roll_number: null
+      };
+
+      await connection.query(`
+        UPDATE ${studentsTable}
+        SET
+          academic_year = ?,
+          enrollment_status = 'Alumni',
+          roll_number = NULL
+        WHERE student_id = ?
+          AND client_id = ?
+      `, [toAcademicYear, item.student_id, clientId]);
+
+      await insertPromotionAudit(connection, batchId, clientId, fromAcademicYear, toAcademicYear, appliedItem);
+      appliedPlan.push(appliedItem);
+    }
+
+    await saveAcademicCalendar(connection, clientId, payload);
+    await connection.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: `Academic year moved from ${fromAcademicYear} to ${toAcademicYear}`,
+      data: promotionResponseData(clientId, fromAcademicYear, toAcademicYear, appliedPlan, {
+        batch_id: batchId,
+        academic_year_start_date: payload.academic_year_start_date,
+        academic_year_end_date: payload.academic_year_end_date
+      })
+    });
+  } catch (error) {
+    await connection.rollback();
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
+}
+
+async function changePassword(req, res) {
+  const loginId = normalizePositiveInteger(req.decoded?.login_id || req.decoded?.loginId);
+  const clientId = normalizePositiveInteger(req.decoded?.client_id || req.decoded?.clientId);
+  const currentPassword = normalizeText(getValue(req.body, 'currentPassword', 'current_password'));
+  const newPassword = normalizeText(getValue(req.body, 'newPassword', 'new_password'));
+  const confirmPassword = normalizeText(getValue(req.body, 'confirmPassword', 'confirm_password'));
+
+  if (!loginId) {
+    return res.status(401).json({
+      success: false,
+      message: 'Login session is required'
+    });
+  }
+
+  if (!currentPassword || !newPassword || !confirmPassword) {
+    return res.status(400).json({
+      success: false,
+      message: 'Current password, new password, and confirmation are required'
+    });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({
+      success: false,
+      message: 'New password must be at least 6 characters'
+    });
+  }
+
+  if (newPassword !== confirmPassword) {
+    return res.status(400).json({
+      success: false,
+      message: 'New password and confirmation do not match'
+    });
+  }
+
+  if (newPassword === currentPassword) {
+    return res.status(400).json({
+      success: false,
+      message: 'New password must be different from current password'
+    });
+  }
+
+  try {
+    const [rows] = await pool.promise().query(`
+      SELECT login_id, passkey, salt
+      FROM ${loginTable}
+      WHERE login_id = ?
+        AND (? IS NULL OR client_id = ?)
+      LIMIT 1
+    `, [loginId, clientId || null, clientId || null]);
+
+    if (!rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: 'Login account not found'
+      });
+    }
+
+    const login = rows[0];
+    if (!passwordMatches(currentPassword, login.salt, login.passkey)) {
+      return res.status(401).json({
+        success: false,
+        message: 'Current password is incorrect'
+      });
+    }
+
+    const nextPassword = hashPassword(newPassword);
+    await pool.promise().query(`
+      UPDATE ${loginTable}
+      SET passkey = ?, salt = ?, password = NULL
+      WHERE login_id = ?
+    `, [nextPassword.passkey, nextPassword.salt, loginId]);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+}
+
 module.exports = {
   getSchoolBranding,
   updateSchoolBranding,
   getAcademicCalendar,
-  updateAcademicCalendar
+  updateAcademicCalendar,
+  previewAcademicYearRollover,
+  applyAcademicYearRollover,
+  changePassword
 };

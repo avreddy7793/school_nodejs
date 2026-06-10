@@ -24,6 +24,8 @@ const holidaysRouter = require("./school/holidays.router");
 const paymentsRouter = require("./school/payments.router");
 const whatsappRouter = require("./school/whatsapp.router");
 const reportsRouter = require("./school/reports.router");
+const uploadsRouter = require("./school/uploads.router");
+const clientsRouter = require("./school/clients.router");
 
 const multer = require('multer');
 const storage = multer.diskStorage({
@@ -35,6 +37,7 @@ const upload = multer({ storage: storage });
 
 module.exports = function (app) {
   app.use(morgan("combined", { stream: winston.stream }));
+  const schoolAccess = [db.checkToken, db.enforceClientScope];
 
   app.all("/", function (req, res, next) {
     res.header("Access-Control-Allow-Origin", "*");
@@ -48,7 +51,7 @@ module.exports = function (app) {
   });
 
   app.post("/api/login", userdb.login);
-  app.use("/api", timetableRouter);
+  app.use("/api", schoolAccess, timetableRouter);
   app.use("/api/school", timetableRouter);
   app.use("/api/school/students", studentsRouter);
   app.use("/api/students", studentsRouter);
@@ -88,6 +91,10 @@ module.exports = function (app) {
   app.use("/api/whatsapp", whatsappRouter);
   app.use("/api/school/reports", reportsRouter);
   app.use("/api/reports", reportsRouter);
+  app.use("/api/school/uploads", uploadsRouter);
+  app.use("/api/uploads", uploadsRouter);
+  app.use("/api/school/clients", clientsRouter);
+  app.use("/api/clients", clientsRouter);
   app.use("/api/school/salaries", salaryRouter);
   app.use("/api/salaries", salaryRouter);
   app.use("/api/school/syllabus", syllabusRouter);

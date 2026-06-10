@@ -1,5 +1,6 @@
 const { pool } = require('../config');
 const crypto = require('crypto');
+const { deleteHostedFile, isHostedUrl } = require('./hostinger-storage');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
@@ -575,6 +576,18 @@ function sendDatabaseError(res, error) {
   });
 }
 
+async function deleteHostedFileQuietly(url) {
+  if (!isHostedUrl(url)) {
+    return;
+  }
+
+  try {
+    await deleteHostedFile(url);
+  } catch (error) {
+    console.warn('Unable to delete hosted student image:', error.message);
+  }
+}
+
 async function ensurePortalLinkTables(connection) {
   await connection.query(`
     CREATE TABLE IF NOT EXISTS ${userEntityLinksTable} (
@@ -1116,6 +1129,7 @@ async function updateStudent(req, res) {
       });
     }
 
+    const oldImageUrl = existingRows[0].img || '';
     const mergedPayload = {
       ...existingRows[0],
       ...payload
@@ -1137,6 +1151,10 @@ async function updateStudent(req, res) {
       ? await createStudentLogin(connection, mergedPayload, Number(req.params.studentId), studentLoginOptions)
       : null;
     await connection.commit();
+
+    if (Object.prototype.hasOwnProperty.call(payload, 'img') && oldImageUrl && oldImageUrl !== payload.img) {
+      await deleteHostedFileQuietly(oldImageUrl);
+    }
 
     return res.status(200).json({
       success: true,
@@ -1208,7 +1226,7 @@ async function deleteStudent(req, res) {
     await connection.beginTransaction();
 
     const [studentRows] = await connection.query(
-      `SELECT student_id FROM ${studentsTable} WHERE student_id = ? LIMIT 1`,
+      `SELECT student_id, img FROM ${studentsTable} WHERE student_id = ? LIMIT 1`,
       [req.params.studentId]
     );
 
@@ -1249,6 +1267,8 @@ async function deleteStudent(req, res) {
     }
     await connection.query(`DELETE FROM ${studentsTable} WHERE student_id = ?`, [req.params.studentId]);
     await connection.commit();
+
+    await deleteHostedFileQuietly(studentRows[0].img || '');
 
     return res.status(200).json({
       success: true,
