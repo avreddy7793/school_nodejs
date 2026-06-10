@@ -7,6 +7,17 @@ const fileUpload = require('express-fileupload');
 require('dotenv').config();
 const cors = require('cors'); // Add this line
 
+const DEFAULT_UPLOAD_LIMIT_BYTES = 5 * 1024 * 1024;
+
+function positiveIntegerFromEnv(value, fallback) {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const uploadLimitBytes = positiveIntegerFromEnv(
+    process.env.MAX_IMAGE_UPLOAD_SIZE_BYTES,
+    DEFAULT_UPLOAD_LIMIT_BYTES
+);
 
 // Enable CORS
 app.use(cors());
@@ -20,7 +31,21 @@ var allowCrossDomain = function (req, response, next) {
 }
 app.use(express.urlencoded({limit: "50mb", extended: true, parameterLimit:50000}));
 app.use(express.json({limit: "50mb"}));
-app.use(fileUpload());
+app.use(fileUpload({
+    limits: { fileSize: uploadLimitBytes },
+    abortOnLimit: true,
+    responseOnLimit: 'Uploaded image is too large. Please choose an image 5 MB or smaller.'
+}));
+app.use((error, req, res, next) => {
+    if (error?.status === 413 || error?.statusCode === 413 || error?.type === 'entity.too.large') {
+        return res.status(413).json({
+            success: false,
+            message: 'Request body is too large. Please choose an image 5 MB or smaller.'
+        });
+    }
+
+    return next(error);
+});
 app.use(express.static('public'));
 app.use(allowCrossDomain);
 
