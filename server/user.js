@@ -30,6 +30,7 @@ const login = (req, res) => {
                         let login_id = results[0].login_id;
                         let role = results[0].role;
                         let role_name = results[0].role_name;
+                        let login_designation = results[0].login_designation;
                         let login_name = results[0].login_name;
                         let emp_name = results[0].emp_name;
                         let category = results[0].category;
@@ -55,10 +56,12 @@ const login = (req, res) => {
                                 client_id: client_id,
                                 role: role,
                                 role_name: role_name,
+                                login_designation: login_designation,
                                 login_type: login_type,
                                 category_id: catgory_id,
                                 entity_type: entity_type,
                                 entity_id: entity_id,
+                                emp_id: emp_id,
                                 teacher_id: teacher_id,
                                 staff_id: staff_id
                             },
@@ -83,6 +86,8 @@ const login = (req, res) => {
                                 role: role,
                                 role_name: role_name,
                                 roleName: role_name,
+                                login_designation: login_designation,
+                                loginDesignation: login_designation,
                                 category: category,
                                 emp_id: emp_id,
                                 client_id: client_id,

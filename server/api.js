@@ -52,6 +52,65 @@ const checkToken = (req,res,next) => {
     }
 };
 
+function isClientManagementPath(req) {
+    const values = [req.path, req.url, req.originalUrl]
+        .map((value) => String(value || '').split('?')[0].toLowerCase());
+    return values.some((path) =>
+        path === '/clients' ||
+        path.startsWith('/clients/') ||
+        path === '/school/clients' ||
+        path.startsWith('/school/clients/') ||
+        path === '/api/clients' ||
+        path.startsWith('/api/clients/') ||
+        path === '/api/school/clients' ||
+        path.startsWith('/api/school/clients/')
+    );
+}
+
+function normalizePositiveInteger(value) {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function applyClientIdToBody(body, clientId) {
+    if (!body) {
+        return;
+    }
+
+    if (Array.isArray(body)) {
+        body.forEach((item) => applyClientIdToBody(item, clientId));
+        return;
+    }
+
+    if (typeof body === 'object' && !Buffer.isBuffer(body)) {
+        body.client_id = clientId;
+        body.clientId = clientId;
+    }
+}
+
+const enforceClientScope = (req, res, next) => {
+    const decoded = req.decoded || {};
+
+    if (isClientManagementPath(req)) {
+        return next();
+    }
+
+    const clientId = normalizePositiveInteger(decoded.client_id || decoded.clientId || decoded.clientid);
+    if (!clientId) {
+        return res.status(403).json({
+            success: false,
+            message: 'Client scope is required for this request'
+        });
+    }
+
+    req.scopedClientId = clientId;
+    req.query.client_id = String(clientId);
+    req.query.clientId = String(clientId);
+    applyClientIdToBody(req.body, clientId);
+
+    return next();
+};
+
 const handleError = function(status,message,res){
     res.send({
         "code": status,
@@ -61,6 +120,7 @@ const handleError = function(status,message,res){
 
 module.exports = {
     checkToken,
+    enforceClientScope,
     decodetoken,
     handleError
 }
