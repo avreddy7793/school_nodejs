@@ -1,6 +1,8 @@
 const { pool } = require('../config');
 const crypto = require('crypto');
 const { deleteHostedFile, isHostedUrl } = require('./hostinger-storage');
+const { importStudentsFromWorkbook } = require('./student-importer');
+const { buildStudentAdmissionNumber } = require('./admission-number');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
@@ -430,27 +432,26 @@ async function generateStudentAdmissionIdentity(connection, payload) {
   const academicYear = normalizeText(payload.academic_year) || currentAcademicYear();
   const section = normalizeText(payload.section);
   const classroomName = await getClassroomName(connection, classroomId);
-  const yearPart = normalizeAdmissionPart(academicYear, 'YEAR');
-  const classPart = normalizeAdmissionPart(classroomName || classroomId, 'CLASS');
-  const sectionPart = normalizeAdmissionPart(section, 'SEC');
-
   const [rollRows] = await connection.query(
     `
       SELECT MAX(COALESCE(roll_number, 0)) AS max_roll
       FROM ${studentsTable}
       WHERE (? IS NULL OR client_id = ?)
         AND class_name = ?
-        AND section = ?
         AND academic_year = ?
     `,
-    [payload.client_id || null, payload.client_id || null, classroomId, section, academicYear]
+    [payload.client_id || null, payload.client_id || null, classroomId, academicYear]
   );
 
   let serial = Number(rollRows[0]?.max_roll || 0) + 1;
   let admissionNumber = '';
 
   while (serial < 10000) {
-    admissionNumber = `${yearPart}-${classPart}-${sectionPart}-${String(serial).padStart(3, '0')}`;
+    admissionNumber = buildStudentAdmissionNumber({
+      academicYear,
+      classroomName: classroomName || classroomId,
+      rollNumber: serial
+    });
     const [existingRows] = await connection.query(
       `SELECT student_id FROM ${studentsTable} WHERE admission_number = ? LIMIT 1`,
       [admissionNumber]
@@ -1282,6 +1283,49 @@ async function deleteStudent(req, res) {
   }
 }
 
+async function importStudents(req, res) {
+  const clientId = normalizePositiveInteger(req.body.clientId || req.body.client_id || req.query.client_id || req.decoded?.client_id);
+
+  if (!req.file?.buffer) {
+    return res.status(400).json({
+      success: false,
+      message: 'Choose an Excel file to import.'
+    });
+  }
+
+  if (!clientId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client id is required for student import.'
+    });
+  }
+
+  try {
+    const stats = await importStudentsFromWorkbook({
+      buffer: req.file.buffer,
+      fileName: req.file.originalname,
+      clientId,
+      academicYear: normalizeText(req.body.academicYear || req.body.academic_year) || currentAcademicYear(),
+      updateExisting: normalizeBoolean(req.body.updateExisting ?? req.body.update_existing, true),
+      createMissing: normalizeBoolean(req.body.createMissing ?? req.body.create_missing, true)
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Import complete. ${stats.students_updated} updated, ${stats.students_inserted} inserted.`,
+      data: stats
+    });
+  } catch (error) {
+    const statusCode = error.code === 'STUDENT_IMPORT_VALIDATION' ? 400 : 500;
+    return res.status(statusCode).json({
+      success: false,
+      message: error.message || 'Unable to import students.',
+      data: error.importStats || null,
+      error: error.code === 'STUDENT_IMPORT_VALIDATION' ? undefined : error.message
+    });
+  }
+}
+
 module.exports = {
   getNextAdmissionNumber,
   getStudents,
@@ -1289,5 +1333,6 @@ module.exports = {
   createStudent,
   updateStudent,
   deactivateStudent,
-  deleteStudent
+  deleteStudent,
+  importStudents
 };

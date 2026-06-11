@@ -8,6 +8,8 @@ router.get('/branding', settings.getSchoolBranding);
 router.put('/branding', settings.updateSchoolBranding);
 router.get('/academic-calendar', settings.getAcademicCalendar);
 router.put('/academic-calendar', settings.updateAcademicCalendar);
+router.get('/class-fees', settings.getClassFeeSetup);
+router.put('/class-fees', db.checkToken, settings.updateClassFeeSetup);
 router.get('/academic-year-rollover/preview', settings.previewAcademicYearRollover);
 router.post('/academic-year-rollover', settings.applyAcademicYearRollover);
 router.put('/password', db.checkToken, settings.changePassword);

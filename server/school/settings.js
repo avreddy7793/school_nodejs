@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const { pool } = require('../config');
 const { deleteHostedFile, isHostedUrl } = require('./hostinger-storage');
+const { buildStudentAdmissionNumber } = require('./admission-number');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
@@ -8,6 +9,7 @@ const schoolSettingsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentif
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
 const sectionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('sections')}`;
+const feesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('fee_records')}`;
 const academicYearPromotionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('student_academic_year_promotions')}`;
 const loginTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('login')}`;
 
@@ -35,6 +37,15 @@ function normalizeText(value) {
 
   const trimmed = String(value).trim();
   return trimmed || null;
+}
+
+function normalizeMoney(value, fallback = null) {
+  if (value === undefined || value === null || value === '') {
+    return fallback;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? Number(parsed.toFixed(2)) : null;
 }
 
 function getValue(body, camelKey, snakeKey = camelKey) {
@@ -132,6 +143,16 @@ function academicYearAliases(value) {
   return Array.from(aliases).filter(Boolean);
 }
 
+function feeYearAliases(value) {
+  const aliases = new Set(academicYearAliases(value));
+  const parts = academicYearParts(value);
+  if (parts) {
+    aliases.add(String(parts.startYear));
+  }
+
+  return Array.from(aliases).filter(Boolean);
+}
+
 function defaultAcademicYear(today = new Date()) {
   const year = today.getFullYear();
   const month = today.getMonth();
@@ -217,6 +238,13 @@ async function ensureSettingsSchema() {
       KEY idx_student_year_promotions_student (student_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
   `);
+}
+
+async function ensureFeeRecordSchema() {
+  const [columns] = await pool.promise().query(`SHOW COLUMNS FROM ${feesTable} LIKE 'hostel_fee'`);
+  if (!columns.length) {
+    await pool.promise().query(`ALTER TABLE ${feesTable} ADD COLUMN hostel_fee DECIMAL(10,2) DEFAULT NULL AFTER transport`);
+  }
 }
 
 function classroomSortRank(name) {
@@ -458,7 +486,7 @@ async function buildAcademicYearRolloverPlan(connection, clientId, fromAcademicY
 }
 
 function rollKey(classroomId, section) {
-  return `${classroomId || ''}|${String(section || '').trim().toLowerCase()}`;
+  return `${classroomId || ''}`;
 }
 
 async function loadRollCounters(connection, clientId, academicYear) {
@@ -467,7 +495,7 @@ async function loadRollCounters(connection, clientId, academicYear) {
     FROM ${studentsTable}
     WHERE client_id = ?
       AND academic_year IN (?)
-    GROUP BY class_name, section
+    GROUP BY class_name
   `, [clientId, academicYearAliases(academicYear)]);
 
   return new Map(rows.map((row) => [
@@ -769,6 +797,213 @@ async function updateAcademicCalendar(req, res) {
   });
 }
 
+async function getClassFeeSetup(req, res) {
+  const clientId = normalizePositiveInteger(req.query.client_id || req.query.clientId || req.decoded?.client_id);
+  const academicYear = normalizeAcademicYear(req.query.academic_year || req.query.academicYear) || defaultAcademicYear();
+
+  if (!clientId) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client id is required'
+    });
+  }
+
+  try {
+    const [rows] = await pool.promise().query(`
+      SELECT
+        c.classroom_id,
+        c.name,
+        COUNT(s.student_id) AS student_count,
+        COALESCE(MIN(CAST(COALESCE(s.yearly_fee, 0) AS DECIMAL(10,2))), 0) AS min_fee,
+        COALESCE(MAX(CAST(COALESCE(s.yearly_fee, 0) AS DECIMAL(10,2))), 0) AS max_fee
+      FROM ${classroomsTable} c
+      LEFT JOIN ${studentsTable} s
+        ON s.class_name = c.classroom_id
+        AND s.client_id = c.client_id
+        AND s.academic_year IN (?)
+        AND s.enrollment_status = 'Active'
+      WHERE c.client_id = ?
+      GROUP BY c.classroom_id, c.name
+    `, [academicYearAliases(academicYear), clientId]);
+
+    const classes = rows
+      .map((row) => {
+        const minFee = Number(row.min_fee || 0);
+        const maxFee = Number(row.max_fee || 0);
+        return {
+          classroom_id: row.classroom_id,
+          name: row.name,
+          student_count: Number(row.student_count || 0),
+          min_fee: minFee,
+          max_fee: maxFee,
+          yearly_fee: minFee === maxFee ? maxFee : maxFee
+        };
+      })
+      .sort(compareClassrooms);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        client_id: clientId,
+        academic_year: normalizeAcademicYear(academicYear),
+        classes
+      }
+    });
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+}
+
+async function updateClassFeeSetup(req, res) {
+  const clientId = normalizePositiveInteger(getValue(req.body, 'clientId', 'client_id') || req.query.client_id || req.decoded?.client_id);
+  const academicYear = normalizeAcademicYear(getValue(req.body, 'academicYear', 'academic_year')) || defaultAcademicYear();
+  const feeItems = Array.isArray(req.body?.fees) ? req.body.fees : [];
+
+  if (!clientId || !academicYear) {
+    return res.status(400).json({
+      success: false,
+      message: 'Client and academic year are required'
+    });
+  }
+
+  const normalizedFees = feeItems
+    .map((item) => ({
+      classroom_id: normalizePositiveInteger(getValue(item, 'classroomId', 'classroom_id')),
+      yearly_fee: normalizeMoney(getValue(item, 'yearlyFee', 'yearly_fee'))
+    }))
+    .filter((item) => item.classroom_id || item.yearly_fee !== null);
+
+  if (!normalizedFees.length) {
+    return res.status(400).json({
+      success: false,
+      message: 'Enter at least one class fee'
+    });
+  }
+
+  if (normalizedFees.some((item) => !item.classroom_id || item.yearly_fee === null)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Each class fee must include a class and a valid amount'
+    });
+  }
+
+  const connection = await pool.promise().getConnection();
+  const academicYearValues = academicYearAliases(academicYear);
+  const feeYearValues = feeYearAliases(academicYear);
+
+  try {
+    await ensureFeeRecordSchema();
+    await connection.beginTransaction();
+
+    const summary = [];
+    for (const item of normalizedFees) {
+      const [classRows] = await connection.query(`
+        SELECT classroom_id, name
+        FROM ${classroomsTable}
+        WHERE classroom_id = ?
+          AND client_id = ?
+        LIMIT 1
+      `, [item.classroom_id, clientId]);
+
+      if (!classRows.length) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: `Class ${item.classroom_id} was not found for this client`
+        });
+      }
+
+      const [studentsResult] = await connection.query(`
+        UPDATE ${studentsTable}
+        SET yearly_fee = ?
+        WHERE client_id = ?
+          AND class_name = ?
+          AND academic_year IN (?)
+          AND enrollment_status = 'Active'
+      `, [item.yearly_fee, clientId, item.classroom_id, academicYearValues]);
+
+      const [feeRecordsResult] = await connection.query(`
+        UPDATE ${feesTable} fr
+        INNER JOIN ${studentsTable} s
+          ON s.student_id = fr.student_id
+          AND s.client_id = fr.client_id
+        SET
+          fr.monthly_fee = ?,
+          fr.total = GREATEST(
+            ? +
+            COALESCE(fr.admission_fee, 0) +
+            COALESCE(fr.registration_fee, 0) +
+            COALESCE(fr.art_material, 0) +
+            COALESCE(fr.transport, 0) +
+            COALESCE(fr.hostel_fee, 0) +
+            COALESCE(fr.books, 0) +
+            COALESCE(fr.uniform, 0) +
+            COALESCE(fr.fine, 0) +
+            COALESCE(fr.others, 0) +
+            COALESCE(fr.previous_balance, 0) -
+            COALESCE(fr.discount, 0),
+            0
+          ),
+          fr.due_balance = GREATEST(
+            GREATEST(
+              ? +
+              COALESCE(fr.admission_fee, 0) +
+              COALESCE(fr.registration_fee, 0) +
+              COALESCE(fr.art_material, 0) +
+              COALESCE(fr.transport, 0) +
+              COALESCE(fr.hostel_fee, 0) +
+              COALESCE(fr.books, 0) +
+              COALESCE(fr.uniform, 0) +
+              COALESCE(fr.fine, 0) +
+              COALESCE(fr.others, 0) +
+              COALESCE(fr.previous_balance, 0) -
+              COALESCE(fr.discount, 0),
+              0
+            ) - COALESCE(fr.deposit, 0),
+            0
+          )
+        WHERE fr.client_id = ?
+          AND s.class_name = ?
+          AND s.academic_year IN (?)
+          AND fr.fee_year IN (?)
+      `, [
+        item.yearly_fee,
+        item.yearly_fee,
+        item.yearly_fee,
+        clientId,
+        item.classroom_id,
+        academicYearValues,
+        feeYearValues
+      ]);
+
+      summary.push({
+        classroom_id: item.classroom_id,
+        name: classRows[0].name,
+        yearly_fee: item.yearly_fee,
+        students_updated: studentsResult.affectedRows || 0,
+        fee_records_updated: feeRecordsResult.affectedRows || 0
+      });
+    }
+
+    await connection.commit();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Class-wise school fees updated successfully',
+      data: {
+        client_id: clientId,
+        academic_year: normalizeAcademicYear(academicYear),
+        summary
+      }
+    });
+  } catch (error) {
+    await connection.rollback();
+    return sendDatabaseError(res, error);
+  } finally {
+    connection.release();
+  }
+}
+
 async function previewAcademicYearRollover(req, res) {
   try {
     await ensureSettingsSchema();
@@ -884,14 +1119,21 @@ async function applyAcademicYearRollover(req, res) {
     for (const item of plan) {
       if (item.action === 'PROMOTE') {
         const toRollNumber = nextRollNumber(rollCounters, item.to_classroom_id, item.to_section);
+        const toAdmissionNumber = buildStudentAdmissionNumber({
+          academicYear: toAcademicYear,
+          classroomName: item.to_classroom_name,
+          rollNumber: toRollNumber
+        });
         const appliedItem = {
           ...item,
-          to_roll_number: toRollNumber
+          to_roll_number: toRollNumber,
+          to_admission_number: toAdmissionNumber
         };
 
         await connection.query(`
           UPDATE ${studentsTable}
           SET
+            admission_number = ?,
             academic_year = ?,
             class_name = ?,
             grade_level = ?,
@@ -902,6 +1144,7 @@ async function applyAcademicYearRollover(req, res) {
           WHERE student_id = ?
             AND client_id = ?
         `, [
+          toAdmissionNumber,
           toAcademicYear,
           item.to_classroom_id,
           item.to_classroom_name,
@@ -1043,6 +1286,8 @@ module.exports = {
   updateSchoolBranding,
   getAcademicCalendar,
   updateAcademicCalendar,
+  getClassFeeSetup,
+  updateClassFeeSetup,
   previewAcademicYearRollover,
   applyAcademicYearRollover,
   changePassword
