@@ -5,6 +5,7 @@ const roomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('host
 const assignmentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('student_room_assignments')}`;
 const paymentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('hostel_payments')}`;
 const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
+const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
 
 const roomColumns = `
   hr.room_id,
@@ -29,6 +30,8 @@ const assignmentColumns = `
   CONCAT_WS(' ', s.first_name, s.middle_name, s.last_name) AS student_name,
   s.admission_number,
   s.gender AS student_gender,
+  s.class_name AS classroom_id,
+  c.name AS classroom_name,
   sra.room_id,
   hr.room_number,
   hr.gender_specific,
@@ -514,9 +517,9 @@ function getAssignments(req, res) {
     }
 
     if (search) {
-      conditions.push('(s.first_name LIKE ? OR s.last_name LIKE ? OR s.admission_number LIKE ? OR hr.room_number LIKE ?)');
+      conditions.push('(s.first_name LIKE ? OR s.last_name LIKE ? OR s.admission_number LIKE ? OR c.name LIKE ? OR hr.room_number LIKE ?)');
       const searchValue = `%${search}%`;
-      values.push(searchValue, searchValue, searchValue, searchValue);
+      values.push(searchValue, searchValue, searchValue, searchValue, searchValue);
     }
 
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -524,6 +527,7 @@ function getAssignments(req, res) {
       SELECT ${assignmentColumns}
       FROM ${assignmentsTable} sra
       INNER JOIN ${studentsTable} s ON s.student_id = sra.student_id
+      LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.class_name AND c.client_id = s.client_id
       INNER JOIN ${roomsTable} hr ON hr.room_id = sra.room_id
       ${whereClause}
       ORDER BY sra.start_date DESC, sra.assignment_id DESC

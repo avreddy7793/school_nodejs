@@ -7,6 +7,7 @@ const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('s
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
 const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
 let feePaymentSchemaReady = null;
+let feeRecordSchemaReady = null;
 
 const feeColumns = [
   'monthly_fee',
@@ -14,6 +15,7 @@ const feeColumns = [
   'registration_fee',
   'art_material',
   'transport',
+  'hostel_fee',
   'books',
   'uniform',
   'fine',
@@ -37,6 +39,7 @@ const selectableColumns = `
   fr.registration_fee,
   fr.art_material,
   fr.transport,
+  fr.hostel_fee,
   fr.books,
   fr.uniform,
   fr.fine,
@@ -140,6 +143,24 @@ async function ensureFeePaymentSchema() {
   return feePaymentSchemaReady;
 }
 
+async function ensureFeeRecordSchema() {
+  if (!feeRecordSchemaReady) {
+    feeRecordSchemaReady = (async () => {
+      const [columns] = await queryAsync(`SHOW COLUMNS FROM ${feesTable} LIKE 'hostel_fee'`);
+      if (!columns.length) {
+        await queryAsync(`ALTER TABLE ${feesTable} ADD COLUMN hostel_fee DECIMAL(10,2) DEFAULT NULL AFTER transport`);
+      }
+    })();
+  }
+
+  return feeRecordSchemaReady;
+}
+
+async function ensureFeeSchema() {
+  await ensureFeeRecordSchema();
+  await ensureFeePaymentSchema();
+}
+
 function buildFeePayload(body) {
   const payload = {
     client_id: normalizePositiveInteger(getValue(body, 'clientId', 'client_id')),
@@ -179,6 +200,7 @@ function buildFeeUpdatePayload(body) {
     registrationFee: 'registration_fee',
     artMaterial: 'art_material',
     transport: 'transport',
+    hostelFee: 'hostel_fee',
     books: 'books',
     uniform: 'uniform',
     fine: 'fine',
@@ -277,7 +299,13 @@ function getNextFeeRegNo(callback) {
   });
 }
 
-function getFeeRecords(req, res) {
+async function getFeeRecords(req, res) {
+  try {
+    await ensureFeeRecordSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
   const { client_id, classroom_id, student_id, fee_year, status } = req.query;
   const conditions = [];
   const values = [];
@@ -332,7 +360,13 @@ function getFeeRecords(req, res) {
   });
 }
 
-function getFeeRecordById(req, res) {
+async function getFeeRecordById(req, res) {
+  try {
+    await ensureFeeRecordSchema();
+  } catch (error) {
+    return sendDatabaseError(res, error);
+  }
+
   const clientId = req.query.client_id;
   const sql = `
     SELECT ${selectableColumns}
@@ -363,7 +397,7 @@ function getFeeRecordById(req, res) {
 
 async function getAllFeePayments(req, res) {
   try {
-    await ensureFeePaymentSchema();
+    await ensureFeeSchema();
   } catch (error) {
     return sendDatabaseError(res, error);
   }
@@ -436,7 +470,7 @@ async function getAllFeePayments(req, res) {
 
 async function createFeeRecord(req, res) {
   try {
-    await ensureFeePaymentSchema();
+    await ensureFeeSchema();
   } catch (error) {
     return sendDatabaseError(res, error);
   }
@@ -534,7 +568,7 @@ async function createFeeRecord(req, res) {
 
 async function updateFeeRecord(req, res) {
   try {
-    await ensureFeePaymentSchema();
+    await ensureFeeSchema();
   } catch (error) {
     return sendDatabaseError(res, error);
   }
@@ -614,7 +648,7 @@ async function updateFeeRecord(req, res) {
 
 async function getFeePayments(req, res) {
   try {
-    await ensureFeePaymentSchema();
+    await ensureFeeSchema();
   } catch (error) {
     return sendDatabaseError(res, error);
   }
