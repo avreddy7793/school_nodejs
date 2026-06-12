@@ -3,6 +3,7 @@ const { pool } = require('../config');
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const transportsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('transports')}`;
 const staffTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('staff')}`;
+const studentsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('students')}`;
 let transportSchemaReady = null;
 
 const selectableColumns = `
@@ -288,6 +289,7 @@ function createTransport(req, res) {
 
 function updateTransport(req, res) {
   const payload = buildTransportUpdatePayload(req.body);
+  const clientId = req.query.client_id || payload.client_id || null;
 
   if (!Object.keys(payload).length) {
     return res.status(400).json({
@@ -304,43 +306,78 @@ function updateTransport(req, res) {
   }
 
   runWithTransportSchema(res, () => {
-    pool.query(`UPDATE ${transportsTable} SET ? WHERE transport_id = ?`, [payload, req.params.transportId], (error, result) => {
-      if (error) {
-        return sendDatabaseError(res, error);
-      }
+    pool.query(
+      `UPDATE ${transportsTable} SET ? WHERE transport_id = ? AND (? IS NULL OR client_id = ?)`,
+      [payload, req.params.transportId, clientId, clientId],
+      (error, result) => {
+        if (error) {
+          return sendDatabaseError(res, error);
+        }
 
-      if (!result.affectedRows) {
-        return res.status(404).json({
-          success: false,
-          message: 'Transport not found'
+        if (!result.affectedRows) {
+          return res.status(404).json({
+            success: false,
+            message: 'Transport not found'
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: 'Transport updated successfully'
         });
       }
-
-      return res.status(200).json({
-        success: true,
-        message: 'Transport updated successfully'
-      });
-    });
+    );
   });
 }
 
 function deleteTransport(req, res) {
-  pool.query(`DELETE FROM ${transportsTable} WHERE transport_id = ?`, [req.params.transportId], (error, result) => {
-    if (error) {
-      return sendDatabaseError(res, error);
-    }
+  const clientId = req.query.client_id || null;
 
-    if (!result.affectedRows) {
-      return res.status(404).json({
-        success: false,
-        message: 'Transport not found'
-      });
-    }
+  runWithTransportSchema(res, () => {
+    pool.query(
+      `
+        SELECT COUNT(*) AS assigned_count
+        FROM ${studentsTable}
+        WHERE transport_id = ?
+          AND (? IS NULL OR client_id = ?)
+      `,
+      [req.params.transportId, clientId, clientId],
+      (countError, countRows) => {
+        if (countError) {
+          return sendDatabaseError(res, countError);
+        }
 
-    return res.status(200).json({
-      success: true,
-      message: 'Transport deleted successfully'
-    });
+        const assignedCount = Number(countRows?.[0]?.assigned_count || 0);
+        if (assignedCount > 0) {
+          return res.status(409).json({
+            success: false,
+            message: `This transport has ${assignedCount} assigned student(s). Deactivate it or move the students before deleting.`
+          });
+        }
+
+        pool.query(
+          `DELETE FROM ${transportsTable} WHERE transport_id = ? AND (? IS NULL OR client_id = ?)`,
+          [req.params.transportId, clientId, clientId],
+          (error, result) => {
+            if (error) {
+              return sendDatabaseError(res, error);
+            }
+
+            if (!result.affectedRows) {
+              return res.status(404).json({
+                success: false,
+                message: 'Transport not found'
+              });
+            }
+
+            return res.status(200).json({
+              success: true,
+              message: 'Transport deleted successfully'
+            });
+          }
+        );
+      }
+    );
   });
 }
 

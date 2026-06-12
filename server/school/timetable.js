@@ -1,4 +1,5 @@
 const { pool } = require('../config');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const tableCache = new Map();
@@ -1200,7 +1201,7 @@ async function getTeacherSubjectAssignments(req, res) {
     `
       ${assignmentSelectSql(basics)}
       ${where}
-      ORDER BY c.name ASC, section_name ASC, subject_name ASC
+      ORDER BY ${classroomOrderSql('c.name')}, section_name ASC, subject_name ASC
     `,
     values
   );
@@ -1311,7 +1312,7 @@ async function getClassSchedule(req, res) {
     `
       ${scheduleSelectSql(basics)}
       ${where}
-      ORDER BY day_of_week ASC, sp.period_number ASC, c.name ASC, section_name ASC
+      ORDER BY day_of_week ASC, sp.period_number ASC, ${classroomOrderSql('c.name')}, section_name ASC
     `,
     values
   );

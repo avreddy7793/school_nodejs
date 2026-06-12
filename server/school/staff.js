@@ -175,6 +175,14 @@ function buildStaffUpdatePayload(body) {
   return payload;
 }
 
+function invalidRequiredStaffUpdateFields(payload) {
+  const requiredFields = ['client_id', 'employee_id', 'firstName', 'lastName', 'role', 'contactNumber', 'joiningDate', 'status'];
+
+  return requiredFields.filter((field) =>
+    Object.prototype.hasOwnProperty.call(payload, field) && payload[field] === null
+  );
+}
+
 async function getNextEmployeeIdAsync(connection) {
   const [results] = await connection.query(`SELECT employee_id FROM ${staffTable}`);
   const maxNumber = results.reduce((max, row) => {
@@ -444,7 +452,7 @@ function updateStaff(req, res) {
     });
   }
 
-  if (Object.values(payload).some((value) => value === null)) {
+  if (invalidRequiredStaffUpdateFields(payload).length) {
     return res.status(400).json({
       success: false,
       message: 'Update values must be valid'

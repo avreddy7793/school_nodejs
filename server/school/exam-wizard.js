@@ -1,4 +1,5 @@
 const { pool } = require('../config');
+const { classroomOrderSql, compareClassNames } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const examGroupsTable = table('exam_groups');
@@ -320,7 +321,7 @@ async function loadExamGroupAssignments(connection, examGroupId, clientId) {
     INNER JOIN ${classroomsTable} c ON c.classroom_id = egc.classroom_id
     LEFT JOIN ${sectionsTable} sec ON sec.section_id = egc.section_id
     WHERE egc.exam_group_id = ? AND egc.client_id = ?
-    ORDER BY c.name ASC, sec.section_name ASC
+    ORDER BY ${classroomOrderSql('c.name')}, sec.section_name ASC
   `, [examGroupId, clientId]);
 
   return rows;
@@ -938,7 +939,7 @@ async function loadSubjectsForAssignments(connection, clientId, assignments) {
     FROM ${subjectsTable} s
     INNER JOIN ${classroomsTable} c ON c.classroom_id = s.classroom_id
     WHERE s.client_id = ? AND s.classroom_id IN (?)
-    ORDER BY c.name ASC, s.sub_name ASC
+    ORDER BY ${classroomOrderSql('c.name')}, s.sub_name ASC
   `, [clientId, classroomIds]);
 
   const byClassroom = new Map();
@@ -1240,7 +1241,7 @@ async function loadTimetable(connection, examGroupId, clientId, filters = {}) {
     LEFT JOIN ${sectionsTable} sec ON sec.section_id = e.section_id
     LEFT JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
     WHERE ${conditions.join(' AND ')}
-    ORDER BY e.exam_date ASC, e.session_name ASC, c.name ASC, sec.section_name ASC, s.sub_name ASC
+    ORDER BY e.exam_date ASC, e.session_name ASC, ${classroomOrderSql('c.name')}, sec.section_name ASC, s.sub_name ASC
   `, values);
 
   return rows;
@@ -1340,7 +1341,7 @@ async function loadHallTicketStudents(connection, examGroupId, clientId, filters
       ON sec.classroom_id = st.class_name
       AND UPPER(TRIM(sec.section_name)) = UPPER(TRIM(st.section))
     WHERE ${conditions.join(' AND ')}
-    ORDER BY c.name ASC, sec.section_name ASC, st.roll_number ASC, st.first_name ASC
+    ORDER BY ${classroomOrderSql('c.name')}, sec.section_name ASC, st.roll_number ASC, st.first_name ASC
   `, values);
 
   return students;
@@ -1613,7 +1614,7 @@ async function loadMarksEntryExams(connection, clientId, examGroupId, req) {
     LEFT JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
     WHERE e.exam_group_id = ? AND e.client_id = ?
       ${filters.length ? `AND ${filters.join(' AND ')}` : ''}
-    ORDER BY e.exam_date ASC, e.session_name ASC, c.name ASC, sec.section_name ASC, s.sub_name ASC
+    ORDER BY e.exam_date ASC, e.session_name ASC, ${classroomOrderSql('c.name')}, sec.section_name ASC, s.sub_name ASC
   `, values);
 
   if (isAdminDecoded(req.decoded || {})) {
@@ -1872,7 +1873,7 @@ async function loadResultRows(connection, clientId, examGroupId, filters = {}) {
     LEFT JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
     LEFT JOIN ${studentsTable} st ON st.student_id = er.student_id
     WHERE ${conditions.join(' AND ')}
-    ORDER BY c.name ASC, sec.section_name ASC, st.roll_number ASC, s.sub_name ASC
+    ORDER BY ${classroomOrderSql('c.name')}, sec.section_name ASC, st.roll_number ASC, s.sub_name ASC
   `, values);
 
   return rows;
@@ -2140,7 +2141,7 @@ function computeMarksStatement(rows) {
 
   return {
     exam_types: examTypes,
-    classes: Array.from(classMap.values()).sort((first, second) => String(first.classroom_name).localeCompare(String(second.classroom_name))),
+    classes: Array.from(classMap.values()).sort((first, second) => compareClassNames(first.classroom_name, second.classroom_name)),
     sections: Array.from(sectionMap.values()).sort((first, second) => String(first.section_name).localeCompare(String(second.section_name))),
     students
   };
@@ -2229,7 +2230,7 @@ async function getMarksStatement(req, res) {
         LEFT JOIN ${subjectsTable} s ON s.subject_id = e.subject_id
         LEFT JOIN ${studentsTable} st ON st.student_id = er.student_id
         WHERE ${conditions.join(' AND ')}
-        ORDER BY c.name ASC, sec.section_name ASC, st.roll_number ASC, st.first_name ASC, s.sub_name ASC, e.exam_type ASC
+        ORDER BY ${classroomOrderSql('c.name')}, sec.section_name ASC, st.roll_number ASC, st.first_name ASC, s.sub_name ASC, e.exam_type ASC
       `, values).then(([statementRows]) => statementRows),
       loadSchoolBranding(database, clientId)
     ]);

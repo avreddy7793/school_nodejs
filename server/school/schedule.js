@@ -1,5 +1,6 @@
 const { pool } = require('../config');
 const whatsapp = require('./whatsapp');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const sessionsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('school_sessions')}`;
@@ -940,7 +941,7 @@ function getSchedules(req, res) {
     LEFT JOIN ${subjectsTable} subj ON subj.subject_id = cs.subject_id
     LEFT JOIN ${sectionsTable} sec ON sec.section_id = cs.section_id
     ${whereClause}
-    ORDER BY cs.session_id ASC, sp.period_number ASC, c.name ASC
+    ORDER BY cs.session_id ASC, sp.period_number ASC, ${classroomOrderSql('c.name')}
   `;
 
   pool.query(sql, values, (error, results) => {

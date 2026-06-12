@@ -1,5 +1,6 @@
 const https = require('https');
 const { pool } = require('../config');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const db = pool.promise();
@@ -363,7 +364,7 @@ async function listOnlineExams(req, res) {
       ${examSelectSql()}
       ${where}
       GROUP BY e.exam_id, oes.online_exam_id
-      ORDER BY e.exam_date DESC, e.exam_id DESC
+      ORDER BY e.exam_date DESC, ${classroomOrderSql('c.name')}, e.exam_id DESC
     `, values);
 
     return res.status(200).json({
@@ -786,7 +787,7 @@ async function getAvailableExams(req, res) {
         AND (oes.starts_at IS NULL OR oes.starts_at <= NOW())
         AND (oes.ends_at IS NULL OR oes.ends_at >= NOW())
       GROUP BY e.exam_id, oes.online_exam_id, own_attempt.attempt_id
-      ORDER BY e.exam_date ASC, e.exam_id ASC
+      ORDER BY e.exam_date ASC, ${classroomOrderSql('c.name')}, e.exam_id ASC
     `, [studentId, clientId, classroomId]);
 
     return res.status(200).json({

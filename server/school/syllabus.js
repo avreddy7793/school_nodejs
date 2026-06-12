@@ -1,4 +1,5 @@
 const { pool } = require('../config');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const syllabusPlansTable = table('syllabus_plans');
@@ -156,7 +157,7 @@ async function getSyllabus(req, res) {
       LEFT JOIN ${subjectsTable} s ON s.subject_id = sp.subject_id
       LEFT JOIN ${syllabusUnitsTable} su ON su.syllabus_plan_id = sp.syllabus_plan_id
       WHERE ${conditions.join(' AND ')}
-      ORDER BY c.name ASC, s.sub_name ASC, sp.academic_year DESC, su.sort_order ASC, su.syllabus_unit_id ASC
+      ORDER BY ${classroomOrderSql('c.name')}, s.sub_name ASC, sp.academic_year DESC, su.sort_order ASC, su.syllabus_unit_id ASC
     `, values);
 
     return res.status(200).json({ success: true, data: rows });
