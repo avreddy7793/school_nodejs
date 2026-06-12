@@ -1,4 +1,5 @@
 const { pool } = require('../config');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const classroomsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('classrooms')}`;
@@ -104,7 +105,7 @@ function getClassrooms(req, res) {
   }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
-  const sql = `SELECT ${selectableColumns} FROM ${classroomsTable} ${whereClause} ORDER BY updated_at DESC`;
+  const sql = `SELECT ${selectableColumns} FROM ${classroomsTable} ${whereClause} ORDER BY ${classroomOrderSql('name')}, updated_at DESC`;
 
   pool.query(sql, values, (error, results) => {
     if (error) {

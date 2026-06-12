@@ -1,5 +1,6 @@
 const { pool } = require('../config');
 const crypto = require('crypto');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
 const teachersTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('teachers')}`;
@@ -767,7 +768,7 @@ function getSubjectsGroupedByClass(req, res) {
     LEFT JOIN ${classroomsTable} c
       ON c.classroom_id = s.classroom_id
     WHERE s.client_id = ?
-    ORDER BY c.name, s.sub_name
+    ORDER BY ${classroomOrderSql('c.name')}, s.sub_name
   `;
 
   pool.query(sql, [clientId], (error, results) => {

@@ -1,4 +1,5 @@
 const { pool } = require('../config');
+const { classroomOrderSql } = require('./classroom-order');
 const whatsapp = require('./whatsapp');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || process.env.DB_DATABASE || 'school';
@@ -186,7 +187,7 @@ async function getProgressCards(req, res) {
       FROM ${studentsTable} s
       LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.class_name
       WHERE ${studentConditions.join(' AND ')}
-      ORDER BY c.name ASC, s.section ASC, s.roll_number ASC, s.first_name ASC
+      ORDER BY ${classroomOrderSql('c.name')}, s.section ASC, s.roll_number ASC, s.first_name ASC
     `, studentValues);
 
     if (!students.length) {
@@ -412,7 +413,7 @@ async function sendProgressCardsWhatsapp(req, res) {
       FROM ${studentsTable} s
       LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.class_name
       WHERE ${studentConditions.join(' AND ')}
-      ORDER BY c.name ASC, s.section ASC, s.first_name ASC
+      ORDER BY ${classroomOrderSql('c.name')}, s.section ASC, s.first_name ASC
     `, studentValues);
 
     if (!students.length) {
@@ -620,7 +621,7 @@ async function getOperationalReports(req, res) {
       LEFT JOIN ${classroomsTable} c ON c.classroom_id = fr.classroom_id
       WHERE ${feeRecordConditions.join(' AND ')}
       HAVING due_amount > 0
-      ORDER BY c.name ASC, s.first_name ASC
+      ORDER BY ${classroomOrderSql('c.name')}, s.first_name ASC
     `, [String(feeCategory || 'ALL').toUpperCase(), ...feeRecordValues]);
 
     const hostelConditions = ['sra.client_id = ?'];
@@ -657,7 +658,7 @@ async function getOperationalReports(req, res) {
         ${hostelPaymentDateConditions.length ? `AND ${hostelPaymentDateConditions.join(' AND ')}` : ''}
       WHERE ${hostelConditions.join(' AND ')}
       GROUP BY c.classroom_id, c.name
-      ORDER BY c.name ASC
+      ORDER BY ${classroomOrderSql('c.name')}
     `, [...hostelPaymentValues, ...hostelValues]);
 
     const transportConditions = ['s.client_id = ?'];
@@ -729,7 +730,7 @@ async function getOperationalReports(req, res) {
       INNER JOIN ${examsTable} e ON e.subject_id = sub.subject_id
         AND ${examConditions.join(' AND ')}
       WHERE ${hallTicketConditions.join(' AND ')}
-      ORDER BY c.name ASC, s.section ASC, s.roll_number ASC, e.exam_date ASC, sub.sub_name ASC
+      ORDER BY ${classroomOrderSql('c.name')}, s.section ASC, s.roll_number ASC, e.exam_date ASC, sub.sub_name ASC
     `, [...examValues, ...hallTicketValues]);
 
     const feeSummary = {

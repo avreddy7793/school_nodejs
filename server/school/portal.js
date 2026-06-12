@@ -1,5 +1,6 @@
 const { pool } = require('../config');
 const holidays = require('./holidays');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const db = pool.promise();
@@ -721,7 +722,7 @@ async function fetchTeacherSchedules(clientId, teacherId) {
       COALESCE(cs.day_of_week, 8) ASC,
       cs.session_id ASC,
       sp.period_number ASC,
-      c.name ASC
+      ${classroomOrderSql('c.name')}
   `, [clientId, teacherId]);
 
   return rows;

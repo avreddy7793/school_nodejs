@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const { pool } = require('../config');
 const { deleteHostedFile, isHostedUrl } = require('./hostinger-storage');
 const { buildStudentAdmissionNumber } = require('./admission-number');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_master')}`;
@@ -253,7 +254,7 @@ function classroomSortRank(name) {
     return 9999;
   }
 
-  if (normalized.includes('NURSERY')) {
+  if (normalized.includes('NURSERY') || normalized.includes('NURSARY')) {
     return -3;
   }
 
@@ -373,7 +374,7 @@ async function buildAcademicYearRolloverPlan(connection, clientId, fromAcademicY
     SELECT classroom_id, name
     FROM ${classroomsTable}
     WHERE client_id = ?
-    ORDER BY name ASC
+    ORDER BY ${classroomOrderSql('name')}
   `, [clientId]);
 
   const orderedClassrooms = classrooms.slice().sort(compareClassrooms);
@@ -415,7 +416,7 @@ async function buildAcademicYearRolloverPlan(connection, clientId, fromAcademicY
       AND s.academic_year IN (?)
       AND s.enrollment_status = 'Active'
     ORDER BY
-      COALESCE(c.name, ''),
+      ${classroomOrderSql('c.name')},
       s.section,
       COALESCE(s.roll_number, 99999),
       s.first_name,

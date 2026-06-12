@@ -1,4 +1,5 @@
 const { pool } = require('../config');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const subjectsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('subjects')}`;
@@ -136,7 +137,7 @@ function getSubjects(req, res) {
     FROM ${subjectsTable} s
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.classroom_id
     ${whereClause}
-    ORDER BY c.name ASC, s.sub_name ASC
+    ORDER BY ${classroomOrderSql('c.name')}, s.sub_name ASC
   `;
 
   pool.query(sql, values, (error, results) => {

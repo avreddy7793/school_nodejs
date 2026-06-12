@@ -1,4 +1,5 @@
 const { pool } = require('../config');
+const { classroomOrderSql } = require('./classroom-order');
 
 const schoolDatabase = process.env.DB_SCHOOL_DATABASE || 'school';
 const examsTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('exams')}`;
@@ -302,7 +303,7 @@ function getExams(req, res) {
     LEFT JOIN ${classroomsTable} c ON c.classroom_id = s.classroom_id
     LEFT JOIN ${syllabusUnitsTable} su ON su.syllabus_unit_id = e.syllabus_unit_id
     ${whereClause}
-    ORDER BY e.exam_date ASC, e.exam_id DESC
+    ORDER BY e.exam_date ASC, ${classroomOrderSql('c.name')}, e.exam_id DESC
   `;
 
   pool.query(sql, values, (error, results) => {
@@ -599,7 +600,7 @@ function getExamResults(req, res) {
     LEFT JOIN ${syllabusUnitsTable} su ON su.syllabus_unit_id = e.syllabus_unit_id
     LEFT JOIN ${studentsTable} st ON st.student_id = er.student_id
     ${whereClause}
-    ORDER BY er.created_at DESC, er.exam_resu_id DESC
+    ORDER BY er.created_at DESC, ${classroomOrderSql('c.name')}, er.exam_resu_id DESC
   `;
 
   pool.query(sql, values, (error, results) => {

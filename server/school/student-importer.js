@@ -175,7 +175,7 @@ function splitFullName(fullName) {
 function classKey(value) {
   const normalized = String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
-  if (normalized.includes('nursery')) {
+  if (normalized.includes('nursery') || normalized.includes('nursary')) {
     return 'NURSERY';
   }
   if (normalized === 'lkg' || normalized.includes('lower kindergarten')) {
