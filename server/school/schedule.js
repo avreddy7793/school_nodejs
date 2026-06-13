@@ -1785,7 +1785,7 @@ async function getStudentAttendance(req, res) {
     return sendDatabaseError(res, error);
   }
 
-  const { schedule_id, attendance_date, attendance_session, client_id, classroom_id, section_id, teacher_id } = req.query;
+  const { schedule_id, attendance_date, date_from, date_to, attendance_session, client_id, classroom_id, section_id, teacher_id } = req.query;
   const conditions = [];
   const values = [];
 
@@ -1797,6 +1797,16 @@ async function getStudentAttendance(req, res) {
   if (attendance_date) {
     conditions.push('sa.attendance_date = ?');
     values.push(attendance_date);
+  }
+
+  if (date_from) {
+    conditions.push('sa.attendance_date >= ?');
+    values.push(date_from);
+  }
+
+  if (date_to) {
+    conditions.push('sa.attendance_date <= ?');
+    values.push(date_to);
   }
 
   const normalizedSession = normalizeString(attendance_session);
@@ -1837,6 +1847,7 @@ async function getStudentAttendance(req, res) {
       sa.student_attendance_id,
       sa.schedule_id,
       sa.student_id,
+      s.admission_number,
       CONCAT(s.first_name, ' ', s.last_name) AS student_name,
       sa.attendance_date,
       sa.attendance_session,
@@ -1847,7 +1858,9 @@ async function getStudentAttendance(req, res) {
       sa.marked_by_teacher_id,
       NULLIF(TRIM(CONCAT(COALESCE(markedTeacher.first_name, ''), ' ', COALESCE(markedTeacher.last_name, ''))), '') AS marked_by_teacher_name,
       cs.classroom_id,
+      c.name AS classroom_name,
       cs.section_id,
+      sec.section_name AS section_name,
       cs.teacher_id,
       NULLIF(TRIM(CONCAT(COALESCE(scheduleTeacher.first_name, ''), ' ', COALESCE(scheduleTeacher.last_name, ''))), '') AS schedule_teacher_name,
       sa.created_at,
@@ -1855,6 +1868,8 @@ async function getStudentAttendance(req, res) {
     FROM ${studentAttendanceTable} sa
     LEFT JOIN ${studentsTable} s ON s.student_id = sa.student_id
     LEFT JOIN ${schedulesTable} cs ON cs.schedule_id = sa.schedule_id
+    LEFT JOIN ${classroomsTable} c ON c.classroom_id = cs.classroom_id
+    LEFT JOIN ${sectionsTable} sec ON sec.section_id = cs.section_id
     LEFT JOIN ${teachersTable} markedTeacher ON markedTeacher.teacher_id = sa.marked_by_teacher_id
     LEFT JOIN ${teachersTable} scheduleTeacher ON scheduleTeacher.teacher_id = cs.teacher_id
     ${whereClause}

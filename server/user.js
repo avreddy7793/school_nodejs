@@ -94,6 +94,7 @@ const login = (req, res) => {
                                 branch_id: branch_id,
                                 last_login: last_login,
                                 login_type : login_type,
+                                category_id: catgory_id,
                                 catgory_id : catgory_id,
                                 entity_type: entity_type,
                                 entity_id: entity_id,

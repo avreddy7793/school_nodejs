@@ -6,6 +6,7 @@ const clientMasterTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifie
 const clientCategoryTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('client_category')}`;
 const loginTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('login')}`;
 const employeesTable = `${escapeIdentifier(schoolDatabase)}.${escapeIdentifier('employess')}`;
+const DEFAULT_CLIENT_ADMIN_ROLE_ID = 3;
 
 function escapeIdentifier(value) {
   return `\`${String(value).replace(/`/g, '``')}\``;
@@ -103,6 +104,7 @@ function mapLogin(row, includeTemporaryPassword = false) {
     status: row.status || '',
     client_id: row.client_id === null || row.client_id === undefined ? null : Number(row.client_id),
     emp_id: row.emp_id === null || row.emp_id === undefined ? null : Number(row.emp_id),
+    role: row.role === null || row.role === undefined ? null : Number(row.role),
     saved_password: row.password || '',
     last_login: row.last_login || null,
     create_date: row.create_date || null,
@@ -176,6 +178,7 @@ async function selectClientLogins(connection, clientId) {
         status,
         client_id,
         emp_id,
+        role,
         password,
         last_login,
         create_date,
@@ -202,7 +205,7 @@ async function createClientAdminEmployee(connection, payload, loginName, email) 
     phone_number: payload.mobile_number || null,
     department: 'Administration',
     created_by: null,
-    role: null
+    role: DEFAULT_CLIENT_ADMIN_ROLE_ID
   };
 
   const [result] = await connection.query(`INSERT INTO ${employeesTable} SET ?`, employeePayload);
@@ -262,13 +265,14 @@ async function createClientAdminLogin(connection, payload, loginOptions) {
     emp_id: employeeId,
     status: 'ACTIVATED',
     category: payload.category,
+    role: DEFAULT_CLIENT_ADMIN_ROLE_ID,
     password
   };
 
   const [result] = await connection.query(`INSERT INTO ${loginTable} SET ?`, loginPayload);
   const [rows] = await connection.query(
     `
-      SELECT login_id, login_email, login_name, login_designation, login_type, status, client_id, emp_id, password, last_login, create_date, update_date
+      SELECT login_id, login_email, login_name, login_designation, login_type, status, client_id, emp_id, role, password, last_login, create_date, update_date
       FROM ${loginTable}
       WHERE login_id = ?
       LIMIT 1
@@ -404,7 +408,7 @@ async function createCategory(req, res) {
   if (!name) {
     return res.status(400).json({
       success: false,
-      message: 'Category name is required.'
+      message: 'Institution type name is required.'
     });
   }
 
@@ -418,7 +422,7 @@ async function createCategory(req, res) {
     if (existingRows.length) {
       return res.status(200).json({
         success: true,
-        message: 'Category already exists.',
+        message: 'Institution type already exists.',
         data: mapCategory({ ...existingRows[0], client_count: 0 })
       });
     }
@@ -430,7 +434,7 @@ async function createCategory(req, res) {
 
     return res.status(201).json({
       success: true,
-      message: 'Category created successfully.',
+      message: 'Institution type created successfully.',
       data: {
         id: result.insertId,
         name
@@ -503,7 +507,10 @@ async function listClients(req, res) {
 }
 
 async function createClient(req, res) {
-  const categoryId = normalizePositiveInteger(getValue(req.body, 'categoryId', 'category'));
+  const categoryId = normalizePositiveInteger(
+    getValue(req.body, 'institutionTypeId', 'institution_type_id') ??
+    getValue(req.body, 'categoryId', 'category')
+  );
   const payload = {
     client_name: normalizeText(getValue(req.body, 'clientName', 'client_name')),
     client_address: normalizeText(getValue(req.body, 'clientAddress', 'client_address')),
@@ -521,7 +528,7 @@ async function createClient(req, res) {
   if (!payload.client_name || !payload.category) {
     return res.status(400).json({
       success: false,
-      message: 'Client name and category are required.'
+      message: 'Client name and institution type are required.'
     });
   }
 
@@ -534,7 +541,7 @@ async function createClient(req, res) {
       await connection.rollback();
       return res.status(400).json({
         success: false,
-        message: 'Selected category does not exist.'
+        message: 'Selected institution type does not exist.'
       });
     }
 
@@ -662,7 +669,7 @@ async function resetClientLoginPassword(req, res) {
 
     const [updatedRows] = await database.query(
       `
-        SELECT login_id, login_email, login_name, login_designation, login_type, status, client_id, emp_id, password, last_login, create_date, update_date
+        SELECT login_id, login_email, login_name, login_designation, login_type, status, client_id, emp_id, role, password, last_login, create_date, update_date
         FROM ${loginTable}
         WHERE login_id = ? AND client_id = ?
         LIMIT 1
